@@ -1,4 +1,15 @@
+# Build artifacts
 /target
 **/*.rs.bk
 *.wasm
-.env/test_snapshots
+
+# Soroban test snapshot artifacts (written on panicking sandbox tests)
+/test_snapshots/
+
+# Environment / editor
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+.DS_Store
