@@ -1,0 +1,12 @@
+[package]
+name = "lumecast-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lumecast cross-module integration tests"
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+lumecast-market = { path = "../market" }
+lumecast-pricing = { path = "../pricing" }
+lumecast-resolution = { path = "../resolution" }

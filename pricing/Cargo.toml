@@ -1,0 +1,12 @@
+[package]
+name = "lumecast-pricing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lumecast pricing module: pari-mutuel (v1) and LMSR (v2) pool math"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk.workspace = true

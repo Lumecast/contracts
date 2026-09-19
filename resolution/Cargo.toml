@@ -1,0 +1,15 @@
+[package]
+name = "lumecast-resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lumecast resolution module: bonded propose/dispute/finalize flow"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk.workspace = true
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
