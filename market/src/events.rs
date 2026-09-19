@@ -22,3 +22,12 @@ pub struct DepositEvent {
     pub from: Address,
     pub amount: i128,
 }
+
+/// Emitted when a market is cancelled and every deposit is refunded.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelMarketEvent {
+    #[topic]
+    pub market_id: u64,
+    pub cancelled_by: Address,
+}

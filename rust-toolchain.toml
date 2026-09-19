@@ -1,4 +1,6 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]
+# Soroban requires this target (wasm32-unknown-unknown is unsupported on
+# Rust 1.82+ due to reference-types / multi-value features).
+targets = ["wasm32v1-none"]

@@ -11,11 +11,13 @@
 #[cfg(test)]
 extern crate std;
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, String, Vec,
+};
 
 use crate::storage::{
-    add_holder, get_market, next_market_id, read_position, require_market, write_market,
-    write_position,
+    add_holder, get_market, next_market_id, read_holders, read_position, require_market,
+    write_market, write_position,
 };
 
 mod error;
@@ -24,7 +26,7 @@ mod storage;
 mod types;
 
 pub use error::Error;
-pub use events::{CreateMarketEvent, DepositEvent};
+pub use events::{CancelMarketEvent, CreateMarketEvent, DepositEvent};
 pub use storage::DataKey;
 pub use types::{Market, MarketState, Outcome, Position, OUTCOME_COUNT};
 
@@ -151,6 +153,52 @@ impl MarketContract {
     pub fn position(env: Env, market_id: u64, owner: Address, outcome: Outcome) -> Position {
         read_position(&env, market_id, &owner, outcome)
     }
+
+    /// Cancel an open market and refund every participant in full.
+    ///
+    /// Only the market creator or resolver may cancel, and only while the
+    /// market is still `Open` (before resolution begins). Each escrow holder
+    /// gets their deposited tokens back, the escrow ledger is zeroed, and the
+    /// market is locked in the `Cancelled` state.
+    pub fn cancel_market(env: Env, market_id: u64, caller: Address) {
+        caller.require_auth();
+
+        let mut market = must_get_market(&env, market_id);
+        if market.state != MarketState::Open {
+            panic_with_error!(&env, Error::MarketNotOpen);
+        }
+        if caller != market.creator && caller != market.resolver {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        // Refund every escrow holder in full, then zero their positions.
+        let token = token::TokenClient::new(&env, &market.asset);
+        let holders = read_holders(&env, market_id);
+        for holder in holders.iter() {
+            for outcome in Outcome::ALL {
+                let mut position = read_position(&env, market_id, &holder, outcome);
+                if position.shares > 0 {
+                    let to = MuxedAddress::from(&holder);
+                    token.transfer(&env.current_contract_address(), &to, &position.shares);
+                    position.shares = 0;
+                    write_position(&env, &position);
+                }
+            }
+        }
+
+        // Lock the market and zero the escrow ledger.
+        market.state = MarketState::Cancelled;
+        let zeros = Vec::from_array(&env, [0i128; OUTCOME_COUNT as usize]);
+        market.pool = zeros.clone();
+        market.shares = zeros;
+        write_market(&env, &market);
+
+        CancelMarketEvent {
+            market_id,
+            cancelled_by: caller,
+        }
+        .publish(&env);
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +217,7 @@ mod tests {
         market_id: u64,
         usdc: Address,
         alice: Address,
+        resolver: Address,
     }
 
     /// Deploy a funded USDC-backed market owned by `alice` with a far-future
@@ -186,9 +235,10 @@ mod tests {
         // Pre-approve the contract to pull settlement tokens on deposit.
         token::TokenClient::new(env, &usdc).approve(&alice, &client.address, &i128::MAX, &100_000);
 
+        let resolver = Address::generate(env);
         let market_id = client.create_market(
             &alice,
-            &Address::generate(env),
+            &resolver,
             &usdc,
             &String::from_str(env, "Will it rain tomorrow?"),
             &1_700_000_000,
@@ -198,6 +248,7 @@ mod tests {
             market_id,
             usdc,
             alice,
+            resolver,
         }
     }
 
@@ -237,6 +288,107 @@ mod tests {
         let second = new_market_with(&env, &client, "Q2");
         assert_eq!(first, 1);
         assert_eq!(second, 2);
+    }
+
+    #[test]
+    fn cancel_refunds_all_holders_in_full() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let funded = funded_market(&env, &client);
+
+        let usdc = token::TokenClient::new(&env, &funded.usdc);
+        let alice_before = usdc.balance(&funded.alice);
+        let bob = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &funded.usdc).mint(&bob, &1_000_000);
+        token::TokenClient::new(&env, &funded.usdc).approve(
+            &bob,
+            &client.address,
+            &i128::MAX,
+            &100_000,
+        );
+        let bob_before = usdc.balance(&bob);
+
+        client.deposit(&funded.market_id, &funded.alice, &Outcome::Yes, &2_000);
+        client.deposit(&funded.market_id, &bob, &Outcome::No, &500);
+
+        client.cancel_market(&funded.market_id, &funded.alice);
+
+        let market = client.market(&funded.market_id).unwrap();
+        assert_eq!(market.state, MarketState::Cancelled);
+        assert_eq!(market.total_pool(), 0);
+
+        assert_eq!(usdc.balance(&funded.alice), alice_before);
+        assert_eq!(usdc.balance(&bob), bob_before);
+        assert_eq!(usdc.balance(&client.address), 0);
+
+        assert_eq!(
+            client
+                .position(&funded.market_id, &funded.alice, &Outcome::Yes)
+                .shares,
+            0
+        );
+    }
+
+    #[test]
+    fn cancel_rejects_non_authority() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let funded = funded_market(&env, &client);
+        let stranger = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_market(&funded.market_id, &stranger)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_twice_is_rejected() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let funded = funded_market(&env, &client);
+
+        client.cancel_market(&funded.market_id, &funded.alice);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_market(&funded.market_id, &funded.alice)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_unknown_market_is_rejected() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let caller = Address::generate(&env);
+            client.cancel_market(&42, &caller)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_emits_event() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let funded = funded_market(&env, &client);
+
+        client.cancel_market(&funded.market_id, &funded.resolver);
+
+        let topics = contract_event_topics(&env);
+        assert!(topics.contains(&Symbol::new(&env, "cancel_market_event")));
+    }
+
+    #[test]
+    fn deposit_after_cancel_is_rejected() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let funded = funded_market(&env, &client);
+
+        client.cancel_market(&funded.market_id, &funded.alice);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.deposit(&funded.market_id, &funded.alice, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
