@@ -10,6 +10,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk.workspace = true
+lumecast-resolution = { path = "../resolution" }
+lumecast-pricing = { path = "../pricing" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

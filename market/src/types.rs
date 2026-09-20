@@ -39,9 +39,6 @@ impl Outcome {
 }
 
 /// Lifecycle state of a market.
-///
-/// `Proposed`/`Resolved` are introduced by the resolution module (M2) but live
-/// here so the storage model is complete from day one.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketState {
@@ -49,6 +46,8 @@ pub enum MarketState {
     Open,
     /// Outcome proposed, inside the dispute window (M2).
     Proposed(Outcome),
+    /// Outcome proposed and disputed; awaiting committee vote (M2).
+    Disputed(Outcome),
     /// Outcome locked in; claims payable (M2).
     Resolved(Outcome),
     /// Cancelled before resolution; all deposits refunded.

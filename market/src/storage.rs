@@ -2,6 +2,7 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use crate::error::Error;
 use crate::types::{Market, Outcome, Position};
+use lumecast_resolution::{GovernanceConfig, Resolution};
 
 /// Persistent storage keys for the market contract.
 ///
@@ -15,6 +16,12 @@ pub enum DataKey {
     /// Full escrow holders per market, used for refund scans on cancel.
     Holders(u64),
     Position(u64, Address, u32),
+    /// Contract admin: configures governance (constructor-set).
+    Admin,
+    /// Platform governance: dispute committee, quorum, protocol fee receiver.
+    Governance,
+    /// Per-market resolution state (proposal + challenges + votes).
+    Resolution(u64),
 }
 
 /// Instance TTL bump applied on every write so active markets stay alive
@@ -107,4 +114,51 @@ pub fn add_holder(env: &Env, market_id: u64, holder: &Address) {
         .instance()
         .set(&DataKey::Holders(market_id), &holders);
     bump_instance(env);
+}
+
+/// Persist the contract admin (constructor-only).
+pub fn write_admin(env: &Env, admin: &Address) {
+    env.storage().instance().set(&DataKey::Admin, admin);
+    bump_instance(env);
+}
+
+/// Read the contract admin, if set.
+pub fn read_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::Admin)
+}
+
+/// Persist the platform governance configuration.
+pub fn write_governance(env: &Env, config: &GovernanceConfig) {
+    env.storage().instance().set(&DataKey::Governance, config);
+    bump_instance(env);
+}
+
+/// Read the platform governance configuration, defaulting to an unset one.
+pub fn read_governance(env: &Env) -> GovernanceConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::Governance)
+        .unwrap_or(GovernanceConfig {
+            committee: Vec::new(env),
+            quorum: 0,
+            protocol_fee_receiver: None,
+        })
+}
+
+/// Persist the per-market resolution state.
+pub fn write_resolution(env: &Env, market_id: u64, resolution: &Resolution) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Resolution(market_id), resolution);
+    bump_instance(env);
+}
+
+/// Read the per-market resolution state, if any.
+pub fn read_resolution(env: &Env, market_id: u64) -> Option<Resolution> {
+    env.storage().instance().get(&DataKey::Resolution(market_id))
+}
+
+/// Remove the per-market resolution state once finally settled.
+pub fn remove_resolution(env: &Env, market_id: u64) {
+    env.storage().instance().remove(&DataKey::Resolution(market_id));
 }
