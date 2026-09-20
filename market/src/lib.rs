@@ -15,7 +15,7 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, String, Vec,
 };
 
-use lumecast_resolution::{in_dispute_window, GovernanceConfig, Resolution};
+use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
 use crate::storage::{
     add_holder, get_market, next_market_id, read_admin, read_governance, read_holders,
@@ -39,6 +39,31 @@ pub use types::{Market, MarketState, Outcome, Position, OUTCOME_COUNT};
 /// Read a market by id, panicking with [`Error::MarketNotFound`] if absent.
 fn must_get_market(env: &Env, id: u64) -> Market {
     require_market(env, id).unwrap_or_else(|err| panic_with_error!(env, err))
+}
+
+/// Decode an inverse outcome, panicking with [`Error::UnknownOutcome`].
+fn outcome_from(env: &Env, index: u32) -> Outcome {
+    Outcome::from_index(index).unwrap_or_else(|err| panic_with_error!(env, err))
+}
+
+/// Send the protocol's share of a forfeited bond to the configured fee
+/// receiver, falling back to the contract admin.
+fn distribute_protocol_fee(
+    env: &Env,
+    token: &token::TokenClient,
+    governance: &GovernanceConfig,
+    protocol_share: i128,
+) {
+    if protocol_share <= 0 {
+        return;
+    }
+    let receiver = governance
+        .protocol_fee_receiver
+        .clone()
+        .or_else(|| read_admin(env))
+        .expect("admin is always set at construction");
+    let to = MuxedAddress::from(&receiver);
+    token.transfer(&env.current_contract_address(), &to, &protocol_share);
 }
 
 #[contract]
@@ -398,6 +423,102 @@ impl MarketContract {
             market_id,
             outcome_index: outcome.index(),
             voter,
+        }
+        .publish(&env);
+    }
+
+    /// Settle a proposed or disputed market and distribute bonds.
+    ///
+    /// - **Proposed (uncontested):** once `DISPUTE_WINDOW_LEDGERS` have elapsed
+    ///   with no dispute, the proposal becomes the resolution and the proposer's
+    ///   bond is returned in full.
+    /// - **Disputed:** once committee quorum is reached, the outcome with the
+    ///   most votes wins; ties favor the proposal. The losing side's bonds are
+    ///   forfeited and split between the winning side (70%) and the protocol
+    ///   fee receiver (30%, or the contract admin if unset).
+    pub fn finalize(env: Env, market_id: u64) {
+        let mut market = must_get_market(&env, market_id);
+        let governance = read_governance(&env);
+        let resolution =
+            read_resolution(&env, market_id).expect("proposed or disputed market has resolution");
+        let token = token::TokenClient::new(&env, &market.asset);
+
+        let (winning, uncontested, returned_bond) = match market.state {
+            MarketState::Proposed(proposed) => {
+                if in_dispute_window(&env, resolution.proposed_ledger) {
+                    panic_with_error!(&env, Error::DisputeWindowOpen);
+                }
+                let to = MuxedAddress::from(&resolution.proposer);
+                token.transfer(&env.current_contract_address(), &to, &resolution.bond);
+                (proposed, true, Some(resolution.bond))
+            }
+            MarketState::Disputed(_) => {
+                if resolution.votes.len() < governance.quorum {
+                    panic_with_error!(&env, Error::QuorumNotReached);
+                }
+
+                let mut for_proposed = 0i128;
+                let mut for_other = 0i128;
+                for i in 0..resolution.votes.len() {
+                    if resolution.votes.get(i).unwrap().1 == resolution.proposed {
+                        for_proposed += 1;
+                    } else {
+                        for_other += 1;
+                    }
+                }
+                // Ties favor the proposal (status quo).
+                let proposer_wins = for_proposed >= for_other;
+
+                if proposer_wins {
+                    // Proposer keeps their own bond, plus a share of every
+                    // forfeited challenger counter-bond.
+                    let to = MuxedAddress::from(&resolution.proposer);
+                    token.transfer(&env.current_contract_address(), &to, &resolution.bond);
+                    for i in 0..resolution.challenges.len() {
+                        let (_, counter_bond) = resolution.challenges.get(i).unwrap();
+                        let (winner_share, protocol_share) = slash_split(counter_bond);
+                        let to = MuxedAddress::from(&resolution.proposer);
+                        token.transfer(&env.current_contract_address(), &to, &winner_share);
+                        distribute_protocol_fee(&env, &token, &governance, protocol_share);
+                    }
+                    // Proposer's own bond is returned in full.
+                    (outcome_from(&env, resolution.proposed), false, Some(resolution.bond))
+                } else {
+                    // Challengers recover their counter-bonds and split the
+                    // proposer's forfeited bond equally.
+                    let n = resolution.challenges.len();
+                    for i in 0..n {
+                        let (challenger, counter_bond) = resolution.challenges.get(i).unwrap();
+                        let to = MuxedAddress::from(challenger);
+                        token.transfer(&env.current_contract_address(), &to, &counter_bond);
+                    }
+                    let (winner_share, protocol_share) = slash_split(resolution.bond);
+                    let per_challenger = if n > 0 {
+                        winner_share / (n as i128)
+                    } else {
+                        0
+                    };
+                    for i in 0..n {
+                        let (challenger, _) = resolution.challenges.get(i).unwrap();
+                        let to = MuxedAddress::from(challenger);
+                        token.transfer(&env.current_contract_address(), &to, &per_challenger);
+                    }
+                    distribute_protocol_fee(&env, &token, &governance, protocol_share);
+                    (outcome_from(&env, resolution.proposed), false, Some(0))
+                }
+            }
+            _ => panic_with_error!(&env, Error::NotProposed),
+        };
+
+        market.state = MarketState::Resolved(winning);
+        write_market(&env, &market);
+        remove_resolution(&env, market_id);
+
+        FinalizeEvent {
+            market_id,
+            outcome_index: winning.index(),
+            uncontested,
+            returned_bond,
         }
         .publish(&env);
     }
