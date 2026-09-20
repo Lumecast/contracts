@@ -15,7 +15,7 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, String, Vec,
 };
 
-use lumecast_resolution::GovernanceConfig;
+use lumecast_resolution::{in_dispute_window, GovernanceConfig, Resolution};
 
 use crate::storage::{
     add_holder, get_market, next_market_id, read_admin, read_governance, read_holders,
@@ -137,6 +137,11 @@ impl MarketContract {
         get_market(&env, id)
     }
 
+    /// Read the per-market resolution state, if any.
+    pub fn resolution(env: Env, market_id: u64) -> Option<Resolution> {
+        read_resolution(&env, market_id)
+    }
+
     /// Buy `amount` shares of `outcome` in `market_id`.
     ///
     /// v1 is pari-mutuel at a fixed 1:1 price, so one deposited USDC mints one
@@ -244,6 +249,155 @@ impl MarketContract {
         CancelMarketEvent {
             market_id,
             cancelled_by: caller,
+        }
+        .publish(&env);
+    }
+
+    /// Propose a final outcome for `market_id`. Only the market resolver may
+    /// call, and only while the market is `Open` (trading closed) and after
+    /// `resolution_ts`. The resolver posts a `bond` of the settlement asset,
+    /// escrowed until the resolution settles.
+    pub fn propose_outcome(
+        env: Env,
+        market_id: u64,
+        resolver: Address,
+        outcome: Outcome,
+        bond: i128,
+    ) {
+        resolver.require_auth();
+
+        if bond <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let mut market = must_get_market(&env, market_id);
+        if resolver != market.resolver {
+            panic_with_error!(&env, Error::NotResolver);
+        }
+        if market.state != MarketState::Open {
+            panic_with_error!(&env, Error::NotProposable);
+        }
+        if env.ledger().timestamp() < market.resolution_ts {
+            panic_with_error!(&env, Error::ResolutionNotReady);
+        }
+
+        // Escrow the resolver's bond alongside the pool.
+        let token = token::TokenClient::new(&env, &market.asset);
+        token.transfer_from(
+            &env.current_contract_address(),
+            &resolver,
+            &env.current_contract_address(),
+            &bond,
+        );
+
+        let proposed_ledger = env.ledger().sequence();
+        let resolution = Resolution {
+            proposed: outcome.index(),
+            proposer: resolver.clone(),
+            bond,
+            proposed_ledger,
+            challenges: Vec::new(&env),
+            votes: Vec::new(&env),
+        };
+        write_resolution(&env, market_id, &resolution);
+
+        market.state = MarketState::Proposed(outcome);
+        write_market(&env, &market);
+
+        ProposeEvent {
+            market_id,
+            outcome_index: outcome.index(),
+            proposer: resolver,
+            bond,
+        }
+        .publish(&env);
+    }
+
+    /// Dispute a proposed outcome within the dispute window. Anyone may
+    /// challenge, but their `counter_bond` must at least match the proposer's
+    /// bond. Escalates the market to `Disputed`, where the committee votes.
+    pub fn dispute(env: Env, market_id: u64, challenger: Address, counter_bond: i128) {
+        challenger.require_auth();
+
+        if counter_bond <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let mut market = must_get_market(&env, market_id);
+        let proposed_outcome = match market.state {
+            MarketState::Proposed(o) => o,
+            _ => panic_with_error!(&env, Error::NotProposed),
+        };
+
+        let mut resolution =
+            read_resolution(&env, market_id).expect("proposed market has resolution");
+        if !in_dispute_window(&env, resolution.proposed_ledger) {
+            panic_with_error!(&env, Error::DisputeWindowClosed);
+        }
+        if counter_bond < resolution.bond {
+            panic_with_error!(&env, Error::BondTooLow);
+        }
+
+        // Escrow the challenger's counter-bond.
+        let token = token::TokenClient::new(&env, &market.asset);
+        token.transfer_from(
+            &env.current_contract_address(),
+            &challenger,
+            &env.current_contract_address(),
+            &counter_bond,
+        );
+
+        resolution
+            .challenges
+            .push_back((challenger.clone(), counter_bond));
+        write_resolution(&env, market_id, &resolution);
+
+        market.state = MarketState::Disputed(proposed_outcome);
+        write_market(&env, &market);
+
+        DisputeEvent {
+            market_id,
+            outcome_index: proposed_outcome.index(),
+            challenger,
+            counter_bond,
+        }
+        .publish(&env);
+    }
+
+    /// Cast a committee vote on a disputed market. Only configured committee
+    /// members may vote; each member's latest vote replaces any earlier one.
+    pub fn vote(env: Env, market_id: u64, voter: Address, outcome: Outcome) {
+        voter.require_auth();
+
+        let market = must_get_market(&env, market_id);
+        if !matches!(market.state, MarketState::Disputed(_)) {
+            panic_with_error!(&env, Error::NotDisputed);
+        }
+
+        let governance = read_governance(&env);
+        if !governance.committee.contains(&voter) {
+            panic_with_error!(&env, Error::NotCommitteeMember);
+        }
+
+        let mut resolution =
+            read_resolution(&env, market_id).expect("disputed market has resolution");
+        let mut replaced = false;
+        for i in 0..resolution.votes.len() {
+            if resolution.votes.get(i).unwrap().0 == voter {
+                resolution.votes.set(i, (voter.clone(), outcome.index()));
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            resolution.votes.push_back((voter.clone(), outcome.index()));
+        }
+        write_resolution(&env, market_id, &resolution);
+
+        VoteEvent {
+            market_id,
+            outcome_index: outcome.index(),
+            voter,
         }
         .publish(&env);
     }
