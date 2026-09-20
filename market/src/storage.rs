@@ -155,10 +155,14 @@ pub fn write_resolution(env: &Env, market_id: u64, resolution: &Resolution) {
 
 /// Read the per-market resolution state, if any.
 pub fn read_resolution(env: &Env, market_id: u64) -> Option<Resolution> {
-    env.storage().instance().get(&DataKey::Resolution(market_id))
+    env.storage()
+        .instance()
+        .get(&DataKey::Resolution(market_id))
 }
 
 /// Remove the per-market resolution state once finally settled.
 pub fn remove_resolution(env: &Env, market_id: u64) {
-    env.storage().instance().remove(&DataKey::Resolution(market_id));
+    env.storage()
+        .instance()
+        .remove(&DataKey::Resolution(market_id));
 }

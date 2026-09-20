@@ -483,7 +483,11 @@ impl MarketContract {
                         distribute_protocol_fee(&env, &token, &governance, protocol_share);
                     }
                     // Proposer's own bond is returned in full.
-                    (outcome_from(&env, resolution.proposed), false, Some(resolution.bond))
+                    (
+                        outcome_from(&env, resolution.proposed),
+                        false,
+                        Some(resolution.bond),
+                    )
                 } else {
                     // Challengers recover their counter-bonds and split the
                     // proposer's forfeited bond equally.
@@ -494,11 +498,7 @@ impl MarketContract {
                         token.transfer(&env.current_contract_address(), &to, &counter_bond);
                     }
                     let (winner_share, protocol_share) = slash_split(resolution.bond);
-                    let per_challenger = if n > 0 {
-                        winner_share / (n as i128)
-                    } else {
-                        0
-                    };
+                    let per_challenger = if n > 0 { winner_share / (n as i128) } else { 0 };
                     for i in 0..n {
                         let (challenger, _) = resolution.challenges.get(i).unwrap();
                         let to = MuxedAddress::from(challenger);
@@ -584,9 +584,16 @@ mod tests {
     use soroban_sdk::{token, Env, Event as _, Symbol, TryFromVal};
 
     fn deploy(env: &Env) -> MarketContractClient<'_> {
+        deploy_with_admin(env).0
+    }
+
+    /// Deploy the contract and return both the client and its construction-time
+    /// admin, so governance fixtures can authenticate `set_governance` calls.
+    fn deploy_with_admin(env: &Env) -> (MarketContractClient<'_>, Address) {
         env.mock_all_auths();
-        let contract_id = env.register(MarketContract, ());
-        MarketContractClient::new(env, &contract_id)
+        let admin = Address::generate(env);
+        let contract_id = env.register(MarketContract, (&admin,));
+        (MarketContractClient::new(env, &contract_id), admin)
     }
 
     struct Funded {
@@ -948,5 +955,276 @@ mod tests {
             &1_700_000_000,
             &1_700_086_400,
         )
+    }
+
+    struct ResolutionFixture {
+        market_id: u64,
+        usdc: Address,
+        resolver: Address,
+        admin: Address,
+        committee: Vec<Address>,
+        yes_holder: Address,
+        no_holder: Address,
+    }
+
+    /// A closed market with USDC escrow, a bonded proposal, committee
+    /// governance, and (optionally) a challenge. Timestamps are advanced past
+    /// `resolution_ts` so proposals are permitted.
+    fn resolution_fixture(
+        env: &Env,
+        client: &MarketContractClient<'_>,
+        admin: &Address,
+        disputed: bool,
+    ) -> ResolutionFixture {
+        let usdc = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let usdc_admin = token::StellarAssetClient::new(env, &usdc);
+
+        let alice = Address::generate(env);
+        let resolver = Address::generate(env);
+        let challenge = Address::generate(env);
+        for who in [&alice, &resolver, &challenge] {
+            usdc_admin.mint(who, &1_000_000);
+            token::TokenClient::new(env, &usdc).approve(who, &client.address, &i128::MAX, &100_000);
+        }
+
+        let market_id = client.create_market(
+            &alice,
+            &resolver,
+            &usdc,
+            &String::from_str(env, "Will it rain tomorrow?"),
+            &1_700_000_000,
+            &1_700_086_400,
+        );
+        client.deposit(&market_id, &alice, &Outcome::Yes, &4_000);
+        client.deposit(&market_id, &challenge, &Outcome::No, &6_000);
+
+        env.ledger().set_timestamp(1_700_086_401);
+        client.propose_outcome(&market_id, &resolver, &Outcome::Yes, &10_000);
+
+        let voters = [
+            Address::generate(env),
+            Address::generate(env),
+            Address::generate(env),
+        ];
+        let committee = Vec::from_array(env, voters);
+        client.set_governance(admin, &committee, &3, &None);
+
+        if disputed {
+            client.dispute(&market_id, &challenge, &10_000);
+        }
+
+        ResolutionFixture {
+            market_id,
+            usdc,
+            resolver,
+            admin: admin.clone(),
+            committee,
+            yes_holder: alice,
+            no_holder: challenge,
+        }
+    }
+
+    fn advance_past_dispute_window(env: &Env) {
+        env.ledger().set_sequence_number(
+            env.ledger().sequence() + lumecast_resolution::DISPUTE_WINDOW_LEDGERS + 1,
+        );
+    }
+
+    #[test]
+    fn propose_escrows_bond_and_moves_state() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let f = resolution_fixture(&env, &client, &admin, false);
+
+        let market = client.market(&f.market_id).unwrap();
+        assert_eq!(market.state, MarketState::Proposed(Outcome::Yes));
+        assert_eq!(
+            token::TokenClient::new(&env, &f.usdc).balance(&client.address),
+            10_000 + 4_000 + 6_000
+        );
+        let res = client.resolution(&f.market_id).unwrap();
+        assert_eq!(res.proposer, f.resolver);
+        assert_eq!(res.bond, 10_000);
+    }
+
+    #[test]
+    fn propose_requires_resolver() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, false);
+            client.propose_outcome(
+                &f.market_id,
+                &Address::generate(&env),
+                &Outcome::Yes,
+                &1_000,
+            )
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn propose_before_resolution_ts_rejected() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, false);
+            env.ledger().set_timestamp(1_699_000_000);
+            client.propose_outcome(&f.market_id, &f.resolver, &Outcome::Yes, &1_000)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dispute_requires_sufficient_counter_bond() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, false);
+            client.dispute(&f.market_id, &Address::generate(&env), &1_000)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dispute_expires_after_window() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, false);
+            advance_past_dispute_window(&env);
+            client.dispute(&f.market_id, &Address::generate(&env), &10_000)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn uncontested_finalize_returns_bond_and_resolves() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let f = resolution_fixture(&env, &client, &admin, false);
+        advance_past_dispute_window(&env);
+
+        let resolver_before = token::TokenClient::new(&env, &f.usdc).balance(&f.resolver);
+        client.finalize(&f.market_id);
+
+        let market = client.market(&f.market_id).unwrap();
+        assert_eq!(market.state, MarketState::Resolved(Outcome::Yes));
+        assert_eq!(
+            token::TokenClient::new(&env, &f.usdc).balance(&f.resolver),
+            resolver_before + 10_000
+        );
+        // Payouts payable: Yes holders split the 10,000 pool.
+        assert_eq!(
+            client.claim(&f.market_id, &Address::generate(&env), &Outcome::No),
+            0
+        );
+    }
+
+    #[test]
+    fn finalize_early_when_proposed_is_rejected() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, false);
+            client.finalize(&f.market_id)
+        }));
+        assert!(result.is_err());
+    }
+
+    fn vote_both_ways(client: &MarketContractClient<'_>, f: &ResolutionFixture) {
+        for (i, voter) in f.committee.iter().enumerate() {
+            let outcome = if i == 2 { Outcome::No } else { Outcome::Yes };
+            client.vote(&f.market_id, &voter, &outcome);
+        }
+    }
+
+    #[test]
+    fn disputed_finalize_slashes_losing_bond() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let f = resolution_fixture(&env, &client, &admin, true);
+
+        let admin_before = token::TokenClient::new(&env, &f.usdc).balance(&f.admin);
+        let resolver_before = token::TokenClient::new(&env, &f.usdc).balance(&f.resolver);
+
+        vote_both_ways(&client, &f);
+        client.finalize(&f.market_id);
+
+        // Yes wins 2-1: proposer takes full bond + 90% of the counter-bond.
+        assert_eq!(
+            token::TokenClient::new(&env, &f.usdc).balance(&f.resolver),
+            resolver_before + 10_000 + (10_000 * 90 / 100)
+        );
+        assert_eq!(
+            token::TokenClient::new(&env, &f.usdc).balance(&f.admin),
+            admin_before + (10_000 * 10 / 100)
+        );
+        assert_eq!(
+            client.market(&f.market_id).unwrap().state,
+            MarketState::Resolved(Outcome::Yes)
+        );
+    }
+
+    #[test]
+    fn disputed_finalize_requires_quorum() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, true);
+            client.vote(&f.market_id, &f.committee.get(0).unwrap(), &Outcome::Yes);
+            client.finalize(&f.market_id)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn vote_rejects_non_committee_member() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, true);
+            client.vote(&f.market_id, &Address::generate(&env), &Outcome::Yes)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn claim_pays_winning_outcome_pro_rata() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let f = resolution_fixture(&env, &client, &admin, true);
+
+        vote_both_ways(&client, &f);
+        client.finalize(&f.market_id);
+
+        // Losing (No) holder receives nothing.
+        let no_claim = client.claim(&f.market_id, &f.no_holder, &Outcome::No);
+        assert_eq!(no_claim, 0);
+
+        // Winning (Yes) holder receives the entire pari-mutuel pool, then a
+        // double claim pays nothing.
+        let first = client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes);
+        assert_eq!(first, 10_000);
+        let second = client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes);
+        assert_eq!(second, 0);
+        // The pool is fully drained from contract escrow.
+        assert_eq!(
+            token::TokenClient::new(&env, &f.usdc).balance(&client.address),
+            0
+        );
+    }
+
+    #[test]
+    fn claim_before_resolution_is_rejected() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let (client, admin) = deploy_with_admin(&env);
+            let f = resolution_fixture(&env, &client, &admin, true);
+            client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes)
+        }));
+        assert!(result.is_err());
     }
 }

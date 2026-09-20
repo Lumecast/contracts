@@ -25,18 +25,20 @@ Out of scope (lives in other repos):
 - Local sandbox environment working end-to-end with a dummy contract
 
 ### M1 — Market Contract v1 (Pari-mutuel) (Week 3-5)
-- `create_market(question, close_ts, resolution_ts, resolver, asset)`
-- `deposit(market_id, outcome, amount)` — pulls USDC via token client, mints position
-- `claim(market_id)` — pays out proportional share of pool to winners post-resolution
-- `cancel_market(market_id)` — admin/resolver path if a market can't be resolved fairly, refunds all participants
-- Unit tests covering: happy path, double-claim prevention, deposits after close, claim before resolution, zero-liquidity edge cases
+- [x] `create_market(question, close_ts, resolution_ts, resolver, asset)`
+- [x] `deposit(market_id, outcome, amount)` — pulls USDC via token client, mints position
+- [x] `claim(market_id, outcome)` — pays out pro-rata share of pool to winners post-resolution (M2 wiring)
+- [x] `cancel_market(market_id)` — creator/resolver path if a market can't be resolved fairly, refunds all participants
+- [x] Unit tests covering: happy path, double-claim prevention, deposits after close, claim before resolution, zero-liquidity edge cases
 
 ### M2 — Resolution Module (Week 5-7)
-- `propose_outcome(market_id, outcome, bond)` — resolver stakes a bond
-- Dispute window (configurable, e.g. 48h)
-- `dispute(market_id, counter_bond)` — opens a challenge, escalates to multisig vote
-- `finalize(market_id)` — locks outcome after window closes uncontested, or after multisig vote resolves a dispute
-- Slashing logic: losing side of a dispute forfeits bond to the winning side + protocol
+- [x] `propose_outcome(market_id, outcome, bond)` — resolver stakes a bond
+- [x] Dispute window (34,560 ledgers ≈ 48h)
+- [x] `dispute(market_id, counter_bond)` — opens a challenge, escalates to multisig vote
+- [x] `vote(market_id, outcome)` — committee member votes; quorum-gated finalize
+- [x] `finalize(market_id)` — locks outcome after window closes uncontested, or after multisig vote resolves a dispute
+- [x] Slashing logic: losing side of a dispute forfeits bond to the winning side + protocol (10%)
+- [x] Unit + integration tests for propose/dispute/vote/finalize/claim lifecycle
 
 ### M3 — LMSR Pricing Upgrade (Week 8-11)
 - Implement LMSR cost function in fixed-point (`i128`) arithmetic

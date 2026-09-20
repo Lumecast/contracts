@@ -127,11 +127,15 @@ See `scripts/` for wrapped versions of common deploy/invoke flows.
 |---|---|
 | `create_market(question, close_ts, resolution_ts, resolver, asset)` | Opens a new market |
 | `deposit(market_id, outcome, amount)` | Buy shares in an outcome |
-| `propose_outcome(market_id, outcome, bond)` | Resolver proposes the final outcome |
-| `dispute(market_id, counter_bond)` | Challenge a proposed outcome |
-| `finalize(market_id)` | Locks in the outcome after dispute window |
-| `claim(market_id)` | Withdraw winnings post-resolution |
 | `cancel_market(market_id)` | Refund all participants if a market can't be resolved fairly |
+| `propose_outcome(market_id, outcome, bond)` | Resolver proposes the final outcome with an escrowed bond |
+| `dispute(market_id, counter_bond)` | Challenge a proposed outcome within the dispute window |
+| `vote(market_id, outcome)` | Committee member casts (or replaces) a vote on a disputed market |
+| `finalize(market_id)` | Locks in the outcome and settles / slashes bonds |
+| `claim(market_id, outcome)` | Withdraw winnings post-resolution (pari-mutuel) |
+
+Events: `CreateMarketEvent`, `DepositEvent`, `CancelMarketEvent`,
+`ProposeEvent`, `DisputeEvent`, `VoteEvent`, `FinalizeEvent`, `ClaimEvent`.
 
 Full parameter types and events are documented in `docs/interface.md` (generated from contract doc comments).
 
