@@ -15,6 +15,7 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, String, Vec,
 };
 
+use lumecast_pricing::pari_mutuel_payout;
 use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
 use crate::storage::{
@@ -521,6 +522,58 @@ impl MarketContract {
             returned_bond,
         }
         .publish(&env);
+    }
+
+    /// Claim the payout for a resolved market. The claimant must hold shares
+    /// in the winning outcome; the payout is their pro-rata share of the total
+    /// pool (pari-mutuel). Claiming zeroes the position so double claims pay
+    /// nothing.
+    pub fn claim(env: Env, market_id: u64, claimant: Address, outcome: Outcome) -> i128 {
+        claimant.require_auth();
+
+        let market = must_get_market(&env, market_id);
+        let winning = match market.state {
+            MarketState::Resolved(winning) => winning,
+            _ => panic_with_error!(&env, Error::NotResolved),
+        };
+
+        let mut position = read_position(&env, market_id, &claimant, outcome);
+        if position.shares <= 0 {
+            return 0;
+        }
+
+        let total_pool = market.total_pool();
+        let winning_shares = market
+            .shares
+            .get(winning.index())
+            .expect("binary market shares");
+
+        let payout = if outcome == winning {
+            pari_mutuel_payout(position.shares, total_pool, winning_shares)
+        } else {
+            0
+        };
+
+        if payout > 0 {
+            let token = token::TokenClient::new(&env, &market.asset);
+            let to = MuxedAddress::from(&claimant);
+            token.transfer(&env.current_contract_address(), &to, &payout);
+        }
+
+        position.shares = 0;
+        write_position(&env, &position);
+
+        if payout > 0 {
+            ClaimEvent {
+                market_id,
+                outcome_index: outcome.index(),
+                claimant,
+                amount: payout,
+            }
+            .publish(&env);
+        }
+
+        payout
     }
 }
 
