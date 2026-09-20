@@ -43,4 +43,6 @@ pub enum Error {
     DisputeWindowOpen = 18,
     /// Claim attempted before the market resolved.
     NotResolved = 19,
+    /// Governance configuration is invalid (empty committee, quorum out of range).
+    InvalidGovernance = 20,
 }

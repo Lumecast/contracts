@@ -4,9 +4,9 @@
 //!
 //! M0 (Foundations): repo scaffolding, CI, pinned Soroban SDK, and the core
 //! domain model — `Market`, `Position`, `Outcome` — plus a working
-//! `create_market` entry point in the local sandbox. `deposit`, `cancel` and
-//! `claim` build on this in M1; `claim` also depends on the resolution module
-//! (M2).
+//! `create_market` entry point in the local sandbox. M1 delivers `deposit`,
+//! `cancel_market`, and `claim`. M2 adds bonded `propose_outcome` /
+//! `dispute` / `finalize` with committee voting and bond slashing.
 
 #[cfg(test)]
 extern crate std;
@@ -15,9 +15,12 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, String, Vec,
 };
 
+use lumecast_resolution::GovernanceConfig;
+
 use crate::storage::{
-    add_holder, get_market, next_market_id, read_holders, read_position, require_market,
-    write_market, write_position,
+    add_holder, get_market, next_market_id, read_admin, read_governance, read_holders,
+    read_position, read_resolution, remove_resolution, require_market, write_admin,
+    write_governance, write_market, write_position, write_resolution,
 };
 
 mod error;
@@ -26,7 +29,10 @@ mod storage;
 mod types;
 
 pub use error::Error;
-pub use events::{CancelMarketEvent, CreateMarketEvent, DepositEvent};
+pub use events::{
+    CancelMarketEvent, ClaimEvent, CreateMarketEvent, DepositEvent, DisputeEvent, FinalizeEvent,
+    ProposeEvent, VoteEvent,
+};
 pub use storage::DataKey;
 pub use types::{Market, MarketState, Outcome, Position, OUTCOME_COUNT};
 
@@ -40,6 +46,48 @@ pub struct MarketContract;
 
 #[contractimpl]
 impl MarketContract {
+    /// Initialize the contract with the platform admin. Only the admin may
+    /// mutate governance configuration afterwards.
+    pub fn __constructor(env: Env, admin: Address) {
+        write_admin(&env, &admin);
+    }
+
+    /// Read the contract admin address.
+    pub fn admin(env: Env) -> Option<Address> {
+        read_admin(&env)
+    }
+
+    /// Read the platform governance configuration.
+    pub fn governance(env: Env) -> GovernanceConfig {
+        read_governance(&env)
+    }
+
+    /// Configure the dispute committee, its quorum, and the protocol fee
+    /// receiver. Admin-only. Quorum must be `1..=committee.len()`.
+    pub fn set_governance(
+        env: Env,
+        caller: Address,
+        committee: Vec<Address>,
+        quorum: u32,
+        protocol_fee_receiver: Option<Address>,
+    ) {
+        caller.require_auth();
+        if Some(caller) != read_admin(&env) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if committee.is_empty() || quorum == 0 || quorum > committee.len() {
+            panic_with_error!(&env, Error::InvalidGovernance);
+        }
+        write_governance(
+            &env,
+            &GovernanceConfig {
+                committee,
+                quorum,
+                protocol_fee_receiver,
+            },
+        );
+    }
+
     /// Create a new binary (YES/NO) market. No funds move yet — USDC enters
     /// via `deposit`.
     pub fn create_market(
