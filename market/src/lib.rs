@@ -15,7 +15,10 @@ use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, Vec,
 };
 
-use lumecast_pricing::{lmsr_seed, pari_mutuel_payout, PricingModel, LMSR_B_MAX};
+use lumecast_pricing::{
+    lmsr_cost_to_buy, lmsr_seed, lmsr_shares_affordable, pari_mutuel_payout, PricingModel,
+    LMSR_B_MAX,
+};
 use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
 use crate::storage::{
@@ -31,8 +34,8 @@ mod types;
 
 pub use error::Error;
 pub use events::{
-    CancelMarketEvent, ClaimEvent, CreateMarketEvent, DepositEvent, DisputeEvent, FinalizeEvent,
-    ProposeEvent, VoteEvent,
+    BuySharesEvent, CancelMarketEvent, ClaimEvent, CreateMarketEvent, DepositEvent, DisputeEvent,
+    FinalizeEvent, ProposeEvent, VoteEvent,
 };
 pub use storage::DataKey;
 pub use types::{CreateMarketParameter, Market, MarketState, Outcome, Position, OUTCOME_COUNT};
@@ -189,10 +192,12 @@ impl MarketContract {
 
     /// Buy `amount` shares of `outcome` in `market_id`.
     ///
-    /// v1 is pari-mutuel at a fixed 1:1 price, so one deposited USDC mints one
-    /// share. The depositor must have approved this contract to spend `amount`
-    /// of the market's settlement asset; the contract then pulls the tokens
-    /// into escrow and credits the depositor's position.
+    /// v1 pari-mutuel markets price shares at a fixed 1:1, so one deposited
+    /// USDC mints one share. LMSR markets trade through `buy_shares` instead —
+    /// this entry point is rejected there. The depositor must have approved
+    /// this contract to spend `amount` of the market's settlement asset; the
+    /// contract then pulls the tokens into escrow and credits the depositor's
+    /// position.
     pub fn deposit(
         env: Env,
         market_id: u64,
@@ -207,6 +212,9 @@ impl MarketContract {
         }
 
         let mut market = must_get_market(&env, market_id);
+        if market.pricing_model() != PricingModel::PariMutuel {
+            panic_with_error!(&env, Error::PricingModelMismatch);
+        }
         if market.state != MarketState::Open {
             panic_with_error!(&env, Error::MarketNotOpen);
         }
@@ -241,6 +249,81 @@ impl MarketContract {
             outcome_index: idx,
             from: from.clone(),
             amount,
+        }
+        .publish(&env);
+
+        position
+    }
+
+    /// Buy `outcome` shares in an LMSR market with up to `amount_in` of the
+    /// settlement asset.
+    ///
+    /// The buyer states a *maximum* spend and receives as many shares as have
+    /// marginal cost within that budget (`lmsr_shares_affordable`); the
+    /// contract pulls exactly `lmsr_cost_to_buy` of the batch, never more, and
+    /// everything else stays in the buyer's wallet. The escrow is credited by
+    /// exactly the marginal cost of the batch, preserving the
+    /// `cash == C(q)` solvency invariant. Only LMSR markets trade here;
+    /// pari-mutuel markets keep the fixed 1:1 `deposit`.
+    pub fn buy_shares(
+        env: Env,
+        market_id: u64,
+        from: Address,
+        outcome: Outcome,
+        amount_in: i128,
+    ) -> Position {
+        from.require_auth();
+
+        if amount_in <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let mut market = must_get_market(&env, market_id);
+        if market.pricing_model() != PricingModel::Lmsr {
+            panic_with_error!(&env, Error::PricingModelMismatch);
+        }
+        if market.state != MarketState::Open {
+            panic_with_error!(&env, Error::MarketNotOpen);
+        }
+        if env.ledger().timestamp() > market.close_ts {
+            panic_with_error!(&env, Error::AfterClose);
+        }
+
+        let q0 = market.shares.get(0).unwrap_or(0);
+        let q1 = market.shares.get(1).unwrap_or(0);
+        let shares_out = lmsr_shares_affordable(market.b, q0, q1, amount_in);
+
+        let idx = outcome.index();
+        let pay = lmsr_cost_to_buy(market.b, q0, q1, shares_out);
+
+        // Pull exactly the marginal cost of the batch into escrow.
+        let token = token::TokenClient::new(&env, &market.asset);
+        token.transfer_from(
+            &env.current_contract_address(),
+            &from,
+            &env.current_contract_address(),
+            &pay,
+        );
+
+        // Cash lives in pool[0] for LMSR markets; shares carry the outcome
+        // counts q0/q1, so `market.total_pool()` recomputes C(q0, q1).
+        market.pool.set(0, market.pool.get(0).unwrap_or(0) + pay);
+        market
+            .shares
+            .set(idx, market.shares.get(idx).unwrap_or(0) + shares_out);
+        write_market(&env, &market);
+
+        let mut position = read_position(&env, market_id, &from, outcome);
+        position.shares += shares_out;
+        write_position(&env, &position);
+        add_holder(&env, market_id, &from);
+
+        BuySharesEvent {
+            market_id,
+            outcome_index: idx,
+            from: from.clone(),
+            amount_in: pay,
+            shares_out,
         }
         .publish(&env);
 
@@ -894,6 +977,149 @@ mod tests {
         assert_eq!(market.total_pool(), seed);
         assert_eq!(market.shares.get(0).unwrap(), 0);
         assert_eq!(market.shares.get(1).unwrap(), 0);
+    }
+
+    /// Deploy an LMSR market (creator seeded) and give `buyer` approved USDC.
+    /// Mirrors `create_market_seeds_lmsr_pool`'s setup so the pool starts at
+    /// exactly `C(0) = seed`.
+    fn lmsr_fixture(
+        env: &Env,
+        client: &MarketContractClient<'_>,
+        b: i128,
+    ) -> (u64, Address, Address, i128) {
+        let usdc = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let usdc_admin = token::StellarAssetClient::new(env, &usdc);
+        let token = token::TokenClient::new(env, &usdc);
+
+        let creator = Address::generate(env);
+        usdc_admin.mint(&creator, &1_000_000);
+        token.approve(&creator, &client.address, &i128::MAX, &100_000);
+
+        let buyer = Address::generate(env);
+        usdc_admin.mint(&buyer, &1_000_000);
+        token.approve(&buyer, &client.address, &i128::MAX, &100_000);
+
+        let market_id = client.create_market(
+            &creator,
+            &CreateMarketParameter {
+                resolver: Address::generate(env),
+                asset: usdc.clone(),
+                question: String::from_str(env, "Q"),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b,
+            },
+        );
+        (market_id, usdc, buyer, lmsr_seed(b))
+    }
+
+    #[test]
+    fn buy_shares_mints_at_lmsr_marginal_cost() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let (market_id, usdc, alice, seed) = lmsr_fixture(&env, &client, b);
+        let token = token::TokenClient::new(&env, &usdc);
+
+        let before = token.balance(&alice);
+        let budget = 1_000i128;
+        let position = client.buy_shares(&market_id, &alice, &Outcome::Yes, &budget);
+        assert!(position.shares > 0);
+
+        let market = client.market(&market_id).unwrap();
+        let pay = market.pool.get(0).unwrap() - seed;
+        let x = market.shares.get(0).unwrap();
+
+        // Spend is within budget and equals the marginal cost of the batch.
+        assert!(pay > 0 && pay <= budget);
+        assert_eq!(pay, lmsr_cost_to_buy(b, 0, 0, x));
+        assert_eq!(token.balance(&alice), before - pay);
+        assert_eq!(position.shares, x);
+
+        // Escrow stays at exactly C(q): cash flows to the creator's seed, not
+        // away from it, and never dips below the winning-outcome coverage.
+        assert_eq!(market.total_pool(), seed + pay);
+        assert_eq!(market.total_pool(), lumecast_pricing::lmsr_cost(b, x, 0));
+        assert_eq!(token.balance(&client.address), market.total_pool());
+    }
+
+    #[test]
+    fn buy_shares_emits_event() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let (market_id, _usdc, alice, seed) = lmsr_fixture(&env, &client, 10_000);
+
+        client.buy_shares(&market_id, &alice, &Outcome::No, &500);
+
+        // Read the observed events before any further invocation, which would
+        // replace the captured frame.
+        let topics = contract_event_topics(&env);
+        assert!(
+            topics.contains(&Symbol::new(&env, "buy_shares_event")),
+            "expected buy_shares_event in {:?}",
+            topics
+        );
+
+        let market = client.market(&market_id).unwrap();
+        let pay = market.pool.get(0).unwrap() - seed;
+        assert!(pay > 0 && pay <= 500);
+    }
+
+    #[test]
+    fn buy_shares_tiny_budget_still_clears_one_share() {
+        // A single whole-token budget always clears at least one share (the
+        // marginal price is <= 1.0). At an empty pool the first share rounds to
+        // zero cost because the surplus term rounds down to the seed's integer;
+        // solvency is preserved since `cost` is unchanged.
+        let env = Env::default();
+        let client = deploy(&env);
+        let (market_id, _usdc, alice, seed) = lmsr_fixture(&env, &client, 10_000);
+
+        let position = client.buy_shares(&market_id, &alice, &Outcome::Yes, &1);
+        assert_eq!(position.shares, 1);
+
+        let market = client.market(&market_id).unwrap();
+        assert_eq!(market.pool.get(0).unwrap() - seed, 0);
+        assert_eq!(
+            market.total_pool(),
+            lumecast_pricing::lmsr_cost(10_000, 1, 0)
+        );
+    }
+
+    #[test]
+    fn buy_shares_rejects_pari_mutuel_market() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let funded = funded_market(&env, &client);
+            client.buy_shares(&funded.market_id, &funded.alice, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn buy_shares_after_close_is_rejected() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, 10_000);
+            env.ledger().set_timestamp(1_700_000_001);
+            client.buy_shares(&market_id, &alice, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deposit_rejects_lmsr_market() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, 10_000);
+            client.deposit(&market_id, &alice, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
     }
 
     #[test]

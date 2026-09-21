@@ -13,6 +13,22 @@ pub struct CreateMarketEvent {
     pub b: i128,
 }
 
+/// Emitted when a depositor buys shares in an LMSR market. `amount_in` is the
+/// marginal cost of the whole batch (what actually left the buyer's wallet)
+/// and `shares_out` is what was minted — unlike `deposit`, the two are not
+/// equal because the price moves as the batch is filled.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuySharesEvent {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub outcome_index: u32,
+    pub from: Address,
+    pub amount_in: i128,
+    pub shares_out: i128,
+}
+
 /// Emitted when a depositor buys shares in an outcome (token enters escrow).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -56,6 +56,4 @@ pub enum Error {
     LmsrNotCancellable = 23,
     /// The holder does not own enough shares to sell.
     InsufficientShares = 24,
-    /// The spend is too small to buy even a single share after rounding.
-    AmountTooSmall = 25,
 }
