@@ -16,8 +16,8 @@ use soroban_sdk::{
 };
 
 use lumecast_pricing::{
-    lmsr_cost_to_buy, lmsr_cost_to_sell, lmsr_seed, lmsr_shares_affordable, pari_mutuel_payout,
-    PricingModel, LMSR_B_MAX,
+    lmsr_cost_to_buy, lmsr_cost_to_sell, lmsr_marginal_price, lmsr_seed, lmsr_shares_affordable,
+    pari_mutuel_payout, PricingModel, LMSR_B_MAX,
 };
 use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
@@ -405,6 +405,23 @@ impl MarketContract {
         read_position(&env, market_id, &owner, outcome)
     }
 
+    /// Marginal price of `outcome` in fixed point (`10_000` == 1.0).
+    ///
+    /// LMSR prices live on the curve `p = e^{q/b} / (e^{q0/b} + e^{q1/b})`;
+    /// the complementary outcome always prices at `10_000 - price`. A
+    /// pari-mutuel market has no curve price (deposits are fixed 1:1), so this
+    /// view rejects it with `PricingModelMismatch`.
+    pub fn price(env: Env, market_id: u64, outcome: Outcome) -> i128 {
+        let market = must_get_market(&env, market_id);
+        if market.pricing_model() != PricingModel::Lmsr {
+            panic_with_error!(&env, Error::PricingModelMismatch);
+        }
+        let idx = outcome.index();
+        let q_self = market.shares.get(idx).unwrap_or(0);
+        let q_other = market.shares.get(1 - idx).unwrap_or(0);
+        lmsr_marginal_price(market.b, q_self, q_other)
+    }
+
     /// Cancel an open market and refund every participant in full.
     ///
     /// Only the market creator or resolver may cancel, and only while the
@@ -420,6 +437,9 @@ impl MarketContract {
         }
         if caller != market.creator && caller != market.resolver {
             panic_with_error!(&env, Error::Unauthorized);
+        }
+        if market.pricing_model() != PricingModel::PariMutuel {
+            panic_with_error!(&env, Error::LmsrNotCancellable);
         }
 
         // Refund every escrow holder in full, then zero their positions.
@@ -684,6 +704,23 @@ impl MarketContract {
         };
 
         market.state = MarketState::Resolved(winning);
+
+        // LMSR markets carry the creator's seed liquidity through the whole
+        // trade; on resolution the *winner-take-all* surplus -- every token
+        // above the 1:1 winning-outcome coverage `q_winning` -- is released
+        // back to the creator, leaving exactly `q_winning` in escrow for
+        // holders to claim one-to-one. Pari-mutuel markets keep the full pool
+        // for pro-rata claims instead.
+        if market.pricing_model() == PricingModel::Lmsr {
+            let q_win = market.shares.get(winning.index()).unwrap_or(0);
+            let sweep = market.total_pool() - q_win;
+            if sweep > 0 {
+                let to = MuxedAddress::from(&market.creator);
+                token.transfer(&env.current_contract_address(), &to, &sweep);
+            }
+            market.pool.set(0, q_win);
+        }
+
         write_market(&env, &market);
         remove_resolution(&env, market_id);
 
@@ -697,13 +734,14 @@ impl MarketContract {
     }
 
     /// Claim the payout for a resolved market. The claimant must hold shares
-    /// in the winning outcome; the payout is their pro-rata share of the total
-    /// pool (pari-mutuel). Claiming zeroes the position so double claims pay
-    /// nothing.
+    /// in the winning outcome. Pari-mutuel claims are pro-rata over the pool;
+    /// LMSR claims are one-for-one (the surplus liquidity was already swept to
+    /// the creator on `finalize`). Claiming zeroes the position so double
+    /// claims pay nothing.
     pub fn claim(env: Env, market_id: u64, claimant: Address, outcome: Outcome) -> i128 {
         claimant.require_auth();
 
-        let market = must_get_market(&env, market_id);
+        let mut market = must_get_market(&env, market_id);
         let winning = match market.state {
             MarketState::Resolved(winning) => winning,
             _ => panic_with_error!(&env, Error::NotResolved),
@@ -721,7 +759,16 @@ impl MarketContract {
             .expect("binary market shares");
 
         let payout = if outcome == winning {
-            pari_mutuel_payout(position.shares, total_pool, winning_shares)
+            match market.pricing_model() {
+                // LMSR claims one-for-one: the creator's seed liquidity was
+                // swept out on finalize, leaving exactly `q_winning` in escrow
+                // to cover every winning share. Capped by the escrow balance in
+                // case of rounding dust.
+                PricingModel::Lmsr => position.shares.min(total_pool),
+                PricingModel::PariMutuel => {
+                    pari_mutuel_payout(position.shares, total_pool, winning_shares)
+                }
+            }
         } else {
             0
         };
@@ -730,6 +777,12 @@ impl MarketContract {
             let token = token::TokenClient::new(&env, &market.asset);
             let to = MuxedAddress::from(&claimant);
             token.transfer(&env.current_contract_address(), &to, &payout);
+            // LMSR escrow ledger follows the physical balance as claims drain
+            // it; pari-mutuel keeps the ledger whole until pro-rata settles.
+            if market.pricing_model() == PricingModel::Lmsr {
+                market.pool.set(0, market.pool.get(0).unwrap_or(0) - payout);
+                write_market(&env, &market);
+            }
         }
 
         position.shares = 0;
@@ -1327,6 +1380,244 @@ mod tests {
             client.sell_shares(&funded.market_id, &funded.alice, &Outcome::Yes, &1)
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_rejects_lmsr_market() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let usdc = env
+                .register_stellar_asset_contract_v2(Address::generate(&env))
+                .address();
+            let usdc_admin = token::StellarAssetClient::new(&env, &usdc);
+            let creator = Address::generate(&env);
+            usdc_admin.mint(&creator, &1_000_000);
+            token::TokenClient::new(&env, &usdc).approve(
+                &creator,
+                &client.address,
+                &i128::MAX,
+                &100_000,
+            );
+            let market_id = client.create_market(
+                &creator,
+                &CreateMarketParameter {
+                    resolver: Address::generate(&env),
+                    asset: usdc,
+                    question: String::from_str(&env, "Q"),
+                    close_ts: 1_700_000_000,
+                    resolution_ts: 1_700_086_400,
+                    b: 10_000,
+                },
+            );
+            client.cancel_market(&market_id, &creator)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn price_is_complementary_and_tracks_the_pool() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, b);
+
+        // A fresh pool prices both sides at exactly 0.5.
+        let p_yes0 = client.price(&market_id, &Outcome::Yes);
+        let p_no0 = client.price(&market_id, &Outcome::No);
+        assert_eq!(p_yes0, lumecast_pricing::lmsr_marginal_price(b, 0, 0));
+        // Fixed-point floors can cost one unit of complementarity.
+        assert!(p_yes0 + p_no0 >= lumecast_pricing::ONE - 1);
+        assert!(p_yes0 + p_no0 <= lumecast_pricing::ONE);
+
+        // Buying YES pushes its price above 0.5 and NO below; they stay exact
+        // complements on the curve.
+        client.buy_shares(&market_id, &alice, &Outcome::Yes, &10_000);
+        let market = client.market(&market_id).unwrap();
+        let q_yes = market.shares.get(0).unwrap();
+        let q_no = market.shares.get(1).unwrap();
+        assert_eq!(
+            client.price(&market_id, &Outcome::Yes),
+            lumecast_pricing::lmsr_marginal_price(b, q_yes, q_no)
+        );
+        assert_eq!(
+            client.price(&market_id, &Outcome::No),
+            lumecast_pricing::lmsr_marginal_price(b, q_no, q_yes)
+        );
+        let p_yes1 = client.price(&market_id, &Outcome::Yes);
+        let p_no1 = client.price(&market_id, &Outcome::No);
+        assert!(p_yes1 + p_no1 >= lumecast_pricing::ONE - 1);
+        assert!(p_yes1 + p_no1 <= lumecast_pricing::ONE);
+        assert!(p_yes1 > p_no1);
+    }
+
+    #[test]
+    fn price_rejects_pari_mutuel_market() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let funded = funded_market(&env, &client);
+            client.price(&funded.market_id, &Outcome::Yes)
+        }));
+        assert!(result.is_err());
+    }
+
+    struct LmsrResolutionFixture {
+        market_id: u64,
+        usdc: Address,
+        creator: Address,
+        yes_holder: Address,
+        no_holder: Address,
+    }
+
+    /// A funded LMSR market with both sides traded and an uncontested YES
+    /// proposal already posted (resolution UT is the standard one used by
+    /// `resolution_fixture`). Callers advance past the dispute window, then
+    /// `finalize`.
+    fn lmsr_resolution_fixture(
+        env: &Env,
+        client: &MarketContractClient<'_>,
+        b: i128,
+    ) -> LmsrResolutionFixture {
+        let usdc = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let usdc_admin = token::StellarAssetClient::new(env, &usdc);
+        let token = token::TokenClient::new(env, &usdc);
+
+        let creator = Address::generate(env);
+        let resolver = Address::generate(env);
+        let yes_holder = Address::generate(env);
+        let no_holder = Address::generate(env);
+        for who in [&creator, &resolver, &yes_holder, &no_holder] {
+            usdc_admin.mint(who, &10_000_000);
+            token.approve(who, &client.address, &i128::MAX, &100_000);
+        }
+
+        let market_id = client.create_market(
+            &creator,
+            &CreateMarketParameter {
+                resolver: resolver.clone(),
+                asset: usdc.clone(),
+                question: String::from_str(env, "Q"),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b,
+            },
+        );
+
+        client.buy_shares(&market_id, &yes_holder, &Outcome::Yes, &10_000);
+        client.buy_shares(&market_id, &no_holder, &Outcome::No, &5_000);
+
+        env.ledger().set_timestamp(1_700_086_401);
+        client.propose_outcome(&market_id, &resolver, &Outcome::Yes, &10_000);
+
+        LmsrResolutionFixture {
+            market_id,
+            usdc,
+            creator,
+            yes_holder,
+            no_holder,
+        }
+    }
+
+    #[test]
+    fn finalize_sweeps_lmsr_liquidity_to_creator() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let f = lmsr_resolution_fixture(&env, &client, b);
+        let token = token::TokenClient::new(&env, &f.usdc);
+        let creator_before = token.balance(&f.creator);
+
+        advance_past_dispute_window(&env);
+        client.finalize(&f.market_id);
+
+        let market = client.market(&f.market_id).unwrap();
+        assert_eq!(market.state, MarketState::Resolved(Outcome::Yes));
+        // Escrow is trimmed to exactly the winning-outcome coverage; the
+        // surplus (== C(q) - q_winning) is the creator's seed liquidity back.
+        let q_yes = market.shares.get(0).unwrap();
+        let q_no = market.shares.get(1).unwrap();
+        assert_eq!(market.total_pool(), q_yes);
+        let creator_gain = token.balance(&f.creator) - creator_before;
+        assert_eq!(
+            creator_gain,
+            lumecast_pricing::lmsr_cost(b, q_yes, q_no) - q_yes
+        );
+    }
+
+    #[test]
+    fn claim_lmsr_pays_one_to_one() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let f = lmsr_resolution_fixture(&env, &client, 10_000);
+        let token = token::TokenClient::new(&env, &f.usdc);
+
+        advance_past_dispute_window(&env);
+        client.finalize(&f.market_id);
+        let market = client.market(&f.market_id).unwrap();
+        let expected = market.shares.get(0).unwrap();
+
+        let before = token.balance(&f.yes_holder);
+        let payout = client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes);
+        assert_eq!(payout, expected);
+        assert_eq!(token.balance(&f.yes_holder), before + expected);
+
+        // Double claims and losing-outcome claims pay nothing; escrow empties.
+        assert_eq!(client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes), 0);
+        assert_eq!(client.claim(&f.market_id, &f.no_holder, &Outcome::No), 0);
+        let market = client.market(&f.market_id).unwrap();
+        assert_eq!(market.total_pool(), 0);
+    }
+
+    #[test]
+    fn lmsr_full_cycle_pays_everyone_and_zeroes_escrow() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let f = lmsr_resolution_fixture(&env, &client, b);
+        let token = token::TokenClient::new(&env, &f.usdc);
+        let market = client.market(&f.market_id).unwrap();
+        let q_yes_before = market.shares.get(0).unwrap();
+        let q_no_before = market.shares.get(1).unwrap();
+
+        // Baselines captured now, after both sides have traded: the creator's
+        // seed is already in the pool and the holders have paid for their
+        // shares, so every delta below is attributable to resolution itself.
+        let creator_before = token.balance(&f.creator);
+        let yes_before = token.balance(&f.yes_holder);
+        let no_before = token.balance(&f.no_holder);
+        let pool_before = market.total_pool();
+
+        advance_past_dispute_window(&env);
+        client.finalize(&f.market_id);
+
+        let yes_payout = client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes);
+        let no_payout = client.claim(&f.market_id, &f.no_holder, &Outcome::No);
+        assert!(yes_payout > 0);
+        assert_eq!(no_payout, 0);
+
+        let market = client.market(&f.market_id).unwrap();
+        let q_yes = market.shares.get(0).unwrap();
+        let q_no = market.shares.get(1).unwrap();
+        assert_eq!(q_yes, q_yes_before);
+        assert_eq!(q_no, q_no_before);
+        // Winner is made whole at 1:1, the creator recovers the seeded
+        // liquidity (the whole surplus above the winning coverage), and the
+        // escrow empties.
+        assert_eq!(yes_payout, q_yes);
+        assert_eq!(token.balance(&f.yes_holder), yes_before + q_yes);
+        assert_eq!(
+            token.balance(&f.creator) - creator_before,
+            pool_before - q_yes
+        );
+        assert_eq!(
+            token.balance(&f.creator) - creator_before,
+            lumecast_pricing::lmsr_cost(b, q_yes, q_no) - q_yes
+        );
+        assert_eq!(market.total_pool(), 0);
+        assert_eq!(token.balance(&f.no_holder), no_before);
     }
 
     #[test]
