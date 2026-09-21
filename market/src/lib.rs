@@ -12,10 +12,10 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, String, Vec,
+    contract, contractimpl, panic_with_error, token, Address, Env, MuxedAddress, Vec,
 };
 
-use lumecast_pricing::pari_mutuel_payout;
+use lumecast_pricing::{lmsr_seed, pari_mutuel_payout, PricingModel, LMSR_B_MAX};
 use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
 use crate::storage::{
@@ -35,7 +35,7 @@ pub use events::{
     ProposeEvent, VoteEvent,
 };
 pub use storage::DataKey;
-pub use types::{Market, MarketState, Outcome, Position, OUTCOME_COUNT};
+pub use types::{CreateMarketParameter, Market, MarketState, Outcome, Position, OUTCOME_COUNT};
 
 /// Read a market by id, panicking with [`Error::MarketNotFound`] if absent.
 fn must_get_market(env: &Env, id: u64) -> Market {
@@ -114,37 +114,55 @@ impl MarketContract {
         );
     }
 
-    /// Create a new binary (YES/NO) market. No funds move yet — USDC enters
-    /// via `deposit`.
-    pub fn create_market(
-        env: Env,
-        creator: Address,
-        resolver: Address,
-        asset: Address,
-        question: String,
-        close_ts: u64,
-        resolution_ts: u64,
-    ) -> u64 {
+    /// Create a new binary (YES/NO) market.
+    ///
+    /// No funds move for a pari-mutuel market (`params.b == 0` — USDC enters
+    /// via `deposit`). For an LMSR market (`params.b > 0`) the creator seeds
+    /// `b * ln(2)` of the settlement asset into the pool so the escrow starts
+    /// at `C(0)` — that initial capital is what makes the
+    /// `escrow >= max(shares)` solvency invariant hold, and it is recovered
+    /// from the pool on `finalize`.
+    pub fn create_market(env: Env, creator: Address, params: CreateMarketParameter) -> u64 {
         creator.require_auth();
 
-        if close_ts >= resolution_ts {
+        if params.close_ts >= params.resolution_ts {
             panic_with_error!(&env, Error::InvalidTiming);
+        }
+        if !(0..=LMSR_B_MAX).contains(&params.b) {
+            panic_with_error!(&env, Error::InvalidLiquidity);
         }
 
         let id = next_market_id(&env);
         let zeros = Vec::from_array(&env, [0i128; OUTCOME_COUNT as usize]);
-        let market = Market {
+        let mut market = Market {
             id,
-            question,
+            question: params.question,
             creator: creator.clone(),
-            resolver,
-            asset,
-            close_ts,
-            resolution_ts,
+            resolver: params.resolver,
+            asset: params.asset,
+            close_ts: params.close_ts,
+            resolution_ts: params.resolution_ts,
             state: MarketState::Open,
             pool: zeros.clone(),
             shares: zeros,
+            b: params.b,
         };
+
+        // An LMSR market is seeded with C(0) = b * ln(2) up front: the escrow
+        // tracks C(q), and this lift-off capital covers the first marginal
+        // purchases before any trader has paid anything in.
+        if market.pricing_model() == PricingModel::Lmsr {
+            let seed = lmsr_seed(market.b);
+            let token = token::TokenClient::new(&env, &market.asset);
+            token.transfer_from(
+                &env.current_contract_address(),
+                &creator,
+                &env.current_contract_address(),
+                &seed,
+            );
+            market.pool = Vec::from_array(&env, [seed, 0]);
+        }
+
         write_market(&env, &market);
 
         CreateMarketEvent {
@@ -152,6 +170,7 @@ impl MarketContract {
             creator: market.creator.clone(),
             resolver: market.resolver.clone(),
             question: market.question.clone(),
+            b: market.b,
         }
         .publish(&env);
 
@@ -581,7 +600,7 @@ impl MarketContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
-    use soroban_sdk::{token, Env, Event as _, Symbol, TryFromVal};
+    use soroban_sdk::{token, Env, Event as _, String, Symbol, TryFromVal};
 
     fn deploy(env: &Env) -> MarketContractClient<'_> {
         deploy_with_admin(env).0
@@ -621,11 +640,14 @@ mod tests {
         let resolver = Address::generate(env);
         let market_id = client.create_market(
             &alice,
-            &resolver,
-            &usdc,
-            &String::from_str(env, "Will it rain tomorrow?"),
-            &1_700_000_000,
-            &1_700_086_400,
+            &CreateMarketParameter {
+                resolver: resolver.clone(),
+                asset: usdc.clone(),
+                question: String::from_str(env, "Will it rain tomorrow?"),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b: 0,
+            },
         );
         Funded {
             market_id,
@@ -645,11 +667,14 @@ mod tests {
 
         let id = client.create_market(
             &creator,
-            &resolver,
-            &asset,
-            &String::from_str(&env, "Will it rain tomorrow?"),
-            &1_700_000_000,
-            &1_700_086_400,
+            &CreateMarketParameter {
+                resolver: resolver.clone(),
+                asset: asset.clone(),
+                question: String::from_str(&env, "Will it rain tomorrow?"),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b: 0,
+            },
         );
         assert_eq!(id, 1);
 
@@ -782,14 +807,93 @@ mod tests {
             let creator = Address::generate(&env);
             client.create_market(
                 &creator,
-                &Address::generate(&env),
-                &Address::generate(&env),
-                &String::from_str(&env, "Q"),
-                &1_700_000_000,
-                &1_700_000_000,
+                &CreateMarketParameter {
+                    resolver: Address::generate(&env),
+                    asset: Address::generate(&env),
+                    question: String::from_str(&env, "Q"),
+                    close_ts: 1_700_000_000,
+                    resolution_ts: 1_700_000_000,
+                    b: 0,
+                },
             )
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_market_rejects_invalid_liquidity() {
+        // Negative or out-of-range `b` is refused before any funds move.
+        for bad_b in [-1i128, lumecast_pricing::LMSR_B_MAX + 1] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let env = Env::default();
+                let client = deploy(&env);
+                client.create_market(
+                    &Address::generate(&env),
+                    &CreateMarketParameter {
+                        resolver: Address::generate(&env),
+                        asset: Address::generate(&env),
+                        question: String::from_str(&env, "Q"),
+                        close_ts: 1_700_000_000,
+                        resolution_ts: 1_700_086_400,
+                        b: bad_b,
+                    },
+                )
+            }));
+            assert!(result.is_err(), "accepted b = {bad_b}");
+        }
+    }
+
+    #[test]
+    fn create_market_seeds_lmsr_pool() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let usdc_admin = token::StellarAssetClient::new(&env, &usdc);
+
+        let creator = Address::generate(&env);
+        usdc_admin.mint(&creator, &1_000_000);
+        token::TokenClient::new(&env, &usdc).approve(
+            &creator,
+            &client.address,
+            &i128::MAX,
+            &100_000,
+        );
+
+        let b = 50_000i128;
+        let seed = lmsr_seed(b);
+        let before = token::TokenClient::new(&env, &usdc).balance(&creator);
+
+        let market_id = client.create_market(
+            &creator,
+            &CreateMarketParameter {
+                resolver: Address::generate(&env),
+                asset: usdc.clone(),
+                question: String::from_str(&env, "Q"),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b,
+            },
+        );
+
+        // The creator funded the C(0) = b * ln(2) seed; the escrow holds it.
+        assert_eq!(
+            token::TokenClient::new(&env, &usdc).balance(&creator),
+            before - seed
+        );
+        assert_eq!(
+            token::TokenClient::new(&env, &usdc).balance(&client.address),
+            seed
+        );
+
+        let market = client.market(&market_id).unwrap();
+        assert_eq!(market.pricing_model(), PricingModel::Lmsr);
+        assert_eq!(market.b, b);
+        assert_eq!(market.total_pool(), seed);
+        assert_eq!(market.shares.get(0).unwrap(), 0);
+        assert_eq!(market.shares.get(1).unwrap(), 0);
     }
 
     #[test]
@@ -802,11 +906,14 @@ mod tests {
 
         let id = client.create_market(
             &creator,
-            &resolver,
-            &Address::generate(&env),
-            &question,
-            &1_700_000_000,
-            &1_700_086_400,
+            &CreateMarketParameter {
+                resolver: resolver.clone(),
+                asset: Address::generate(&env),
+                question: question.clone(),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b: 0,
+            },
         );
         assert_eq!(id, 1);
         assert_eq!(
@@ -816,6 +923,7 @@ mod tests {
                 creator,
                 resolver,
                 question,
+                b: 0,
             }
             .to_xdr(&env, &client.address)]
         );
@@ -933,11 +1041,14 @@ mod tests {
             env.ledger().set_timestamp(100);
             let market_id = client.create_market(
                 &alice,
-                &Address::generate(&env),
-                &usdc,
-                &String::from_str(&env, "Q"),
-                &50,
-                &1_700_086_400,
+                &CreateMarketParameter {
+                    resolver: Address::generate(&env),
+                    asset: usdc,
+                    question: String::from_str(&env, "Q"),
+                    close_ts: 50,
+                    resolution_ts: 1_700_086_400,
+                    b: 0,
+                },
             );
             env.ledger().set_timestamp(51);
 
@@ -949,11 +1060,14 @@ mod tests {
     fn new_market_with(env: &Env, client: &MarketContractClient<'_>, question: &str) -> u64 {
         client.create_market(
             &Address::generate(env),
-            &Address::generate(env),
-            &Address::generate(env),
-            &String::from_str(env, question),
-            &1_700_000_000,
-            &1_700_086_400,
+            &CreateMarketParameter {
+                resolver: Address::generate(env),
+                asset: Address::generate(env),
+                question: String::from_str(env, question),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b: 0,
+            },
         )
     }
 
@@ -991,11 +1105,14 @@ mod tests {
 
         let market_id = client.create_market(
             &alice,
-            &resolver,
-            &usdc,
-            &String::from_str(env, "Will it rain tomorrow?"),
-            &1_700_000_000,
-            &1_700_086_400,
+            &CreateMarketParameter {
+                resolver: resolver.clone(),
+                asset: usdc.clone(),
+                question: String::from_str(env, "Will it rain tomorrow?"),
+                close_ts: 1_700_000_000,
+                resolution_ts: 1_700_086_400,
+                b: 0,
+            },
         );
         client.deposit(&market_id, &alice, &Outcome::Yes, &4_000);
         client.deposit(&market_id, &challenge, &Outcome::No, &6_000);

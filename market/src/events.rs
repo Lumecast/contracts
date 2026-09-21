@@ -9,6 +9,8 @@ pub struct CreateMarketEvent {
     pub creator: Address,
     pub resolver: Address,
     pub question: String,
+    /// LMSR liquidity parameter; `0` for the pari-mutuel model.
+    pub b: i128,
 }
 
 /// Emitted when a depositor buys shares in an outcome (token enters escrow).

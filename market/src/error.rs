@@ -45,4 +45,17 @@ pub enum Error {
     NotResolved = 19,
     /// Governance configuration is invalid (empty committee, quorum out of range).
     InvalidGovernance = 20,
+    /// Liquidity parameter `b` is outside `[0, LMSR_B_MAX]`; zero selects the
+    /// pari-mutuel model, anything above selects LMSR.
+    InvalidLiquidity = 21,
+    /// Operation only applies to the market's pricing model (deposit on an
+    /// LMSR market, or buy/sell on a pari-mutuel market).
+    PricingModelMismatch = 22,
+    /// LMSR markets cannot be cancelled; they exit via resolution, with the
+    /// seeded liquidity recovered through `finalize`.
+    LmsrNotCancellable = 23,
+    /// The holder does not own enough shares to sell.
+    InsufficientShares = 24,
+    /// The spend is too small to buy even a single share after rounding.
+    AmountTooSmall = 25,
 }

@@ -3,7 +3,9 @@
 //! Spins up the lumecast-market contract next to a sandboxed USDC-like asset
 //! and walks three participants through the full money-in / money-back path.
 
-use lumecast_market::{MarketContract, MarketContractClient, MarketState, Outcome};
+use lumecast_market::{
+    CreateMarketParameter, MarketContract, MarketContractClient, MarketState, Outcome,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
@@ -47,11 +49,14 @@ fn setup(env: &Env) -> Players {
     let resolver = Address::generate(env);
     let market_id = client.create_market(
         &alice,
-        &resolver,
-        &usdc,
-        &String::from_str(env, "Will Lumecast launch its first market on Mainnet?"),
-        &1_700_000_000,
-        &1_700_086_400,
+        &CreateMarketParameter {
+            resolver: resolver.clone(),
+            asset: usdc.clone(),
+            question: String::from_str(env, "Will Lumecast launch its first market on Mainnet?"),
+            close_ts: 1_700_000_000,
+            resolution_ts: 1_700_086_400,
+            b: 0,
+        },
     );
 
     Players {
