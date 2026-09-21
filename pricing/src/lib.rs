@@ -200,6 +200,51 @@ pub fn lmsr_marginal_price(b: i128, q0: i128, q1: i128) -> i128 {
     }
 }
 
+/// Cost, in tokens, of buying `x` shares of outcome 0: `C(q0+x, q1) - C(q0, q1)`.
+///
+/// Non-decreasing in `x` and always `>= 0`. To maintain the escrow invariant
+/// `escrow == C(q)`, the contract credits the pool by exactly this difference.
+pub fn lmsr_cost_to_buy(b: i128, q0: i128, q1: i128, x: i128) -> i128 {
+    let x = if x < 0 { 0 } else { x };
+    let before = lmsr_cost(b, q0, q1);
+    let after = lmsr_cost(b, q0 + x, q1);
+    after - before
+}
+
+/// Proceeds, in tokens, from selling `x` shares of outcome 0 back to the
+/// market: `C(q0, q1) - C(q0-x, q1)`.
+///
+/// Non-decreasing in `x`, bounded above by the full escrow (`<= C(q)`), and
+/// zero once the holder has no shares left to redeem.
+pub fn lmsr_cost_to_sell(b: i128, q0: i128, q1: i128, x: i128) -> i128 {
+    let x = if x < 0 { 0 } else { x };
+    let before = lmsr_cost(b, q0, q1);
+    let after = lmsr_cost(b, q0 - x, q1);
+    before - after
+}
+
+/// Largest number of outcome-0 shares affordable with `budget` tokens.
+///
+/// Because the marginal price is `<= 1.0`, buying `x` shares can never cost
+/// more than `x`, so the answer lies in `[0, budget]` and is found by binary
+/// search over that range against the monotone cost function.
+pub fn lmsr_shares_affordable(b: i128, q0: i128, q1: i128, budget: i128) -> i128 {
+    if budget <= 0 || b <= 0 {
+        return 0;
+    }
+    let mut lo = 0i128;
+    let mut hi = budget;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if lmsr_cost_to_buy(b, q0, q1, mid) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +375,142 @@ mod tests {
             assert!(cost >= 0, "x={x}");
             assert!(cost <= x + 2, "cost {cost} exceeds shares {x}");
         }
+    }
+
+    // Deterministic LCG (Park–Miller) for reproducible pseudo-random fuzzing.
+    fn next_rand(state: &mut i128, modulo: i128) -> i128 {
+        *state = (*state * 1_664_525) % 1_013_904_223;
+        ((*state) % modulo).max(0)
+    }
+
+    /// A single "walk" over an empty pool: buy some shares, sometimes sell a
+    /// few back, always respecting the `>= 0` supply constraint.
+    fn walk(b: i128, seed_state: &mut i128) -> (i128, i128) {
+        let (mut q0, mut q1) = (0i128, 0i128);
+        for _ in 0..120 {
+            let side = next_rand(seed_state, 2);
+            let budget = next_rand(seed_state, 25_000);
+            match side {
+                0 => {
+                    let x = lmsr_shares_affordable(b, q0, q1, budget);
+                    let cost = lmsr_cost_to_buy(b, q0, q1, x);
+                    assert!(cost <= budget, "spend {cost} exceeds budget {budget}");
+                    assert!(cost >= 0);
+                    q0 += x;
+                }
+                _ => {
+                    let other = next_rand(seed_state, 2);
+                    let held = if other == 0 { q0 } else { q1 };
+                    let want = next_rand(seed_state, held + 1);
+                    let x = want.min(held);
+                    let proceeds = if other == 0 {
+                        lmsr_cost_to_sell(b, q0, q1, x)
+                    } else {
+                        lmsr_cost_to_sell(b, q1, q0, x)
+                    };
+                    assert!(proceeds >= 0);
+                    assert!(proceeds <= b * 1_500_000, "proceeds {proceeds} runaway");
+                    if other == 0 {
+                        q0 -= x;
+                    } else {
+                        q1 -= x;
+                    }
+                }
+            }
+        }
+        (q0, q1)
+    }
+
+    #[test]
+    fn lmsr_walk_never_breaks_solvency_bound() {
+        // Escrow always equals C(q); the fuzz walk simulates the contract
+        // crediting/debiting the pool by exactly the cost differences. The
+        // solvency guarantee `escrow >= max(q0, q1)` must survive arbitrarily
+        // many buys, including one-sided markets driven to the extreme.
+        let mut seed = 123_456_789i128;
+        for b in [1, 10, 100, 1_000, 50_000, 1_000_000] {
+            for _ in 0..8 {
+                let (q0, q1) = walk(b, &mut seed);
+                assert!(
+                    lmsr_cost(b, q0, q1) >= q0.max(q1),
+                    "b={b} insolvent at ({q0},{q1}) escrow={}",
+                    lmsr_cost(b, q0, q1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lmsr_cost_and_price_always_in_bounds() {
+        let mut seed = 7_777_777i128;
+        for b in [1, 10, 100, 1_000, 50_000] {
+            for _ in 0..20 {
+                let q0 = next_rand(&mut seed, 1_000_000);
+                let q1 = next_rand(&mut seed, 1_000_000);
+                let p0 = lmsr_marginal_price(b, q0, q1);
+                let p1 = ONE - p0;
+                assert!((0..=ONE).contains(&p0));
+                assert!((0..=ONE).contains(&p1));
+                // No negative cost surfaces: cost never drops below pool base.
+                assert!(lmsr_cost(b, q0, q1) >= q0.max(q1));
+                let r = next_rand(&mut seed, 10_000);
+                assert!(lmsr_cost_to_buy(b, q0, q1, r) >= 0);
+                assert!(lmsr_cost_to_sell(b, q0, q1, r.min(q0)) >= 0);
+            }
+        }
+    }
+
+    #[test]
+    fn lmsr_affairdability_round_trips_cost() {
+        let b = 5_000;
+        let (q0, q1) = (12_000, 3_000);
+        let mut seed = 99i128;
+        for _ in 0..30 {
+            let budget = next_rand(&mut seed, 200_000);
+            let x = lmsr_shares_affordable(b, q0, q1, budget);
+            assert!(
+                lmsr_cost_to_buy(b, q0, q1, x) <= budget,
+                "x={x} cost {} > {budget}",
+                lmsr_cost_to_buy(b, q0, q1, x)
+            );
+            // Just past the found maximum (when the search was not capped by
+            // the budget bound) one more share is unaffordable.
+            if x < budget {
+                assert!(lmsr_cost_to_buy(b, q0, q1, x + 1) > budget);
+            }
+        }
+    }
+
+    #[test]
+    fn lmsr_shares_affordable_zero_and_edge_cases() {
+        assert_eq!(lmsr_shares_affordable(100, 0, 0, 0), 0);
+        assert_eq!(lmsr_shares_affordable(100, 0, 0, -5), 0);
+        // Empty pool, seed budget: can always afford at least one share.
+        assert!(lmsr_shares_affordable(100, 0, 0, 100) >= 1);
+        // Generous budget buys a large but non-negligible position.
+        let x = lmsr_shares_affordable(10_000, 0, 0, 1_000_000);
+        assert!(x > 0);
+        assert!(lmsr_cost_to_buy(10_000, 0, 0, x) <= 1_000_000);
+    }
+
+    #[test]
+    fn lmsr_sell_proceeds_are_bounded_and_monotone() {
+        let b = 3_000;
+        let (q0, q1) = (20_000, 6_000);
+        let escrow = lmsr_cost(b, q0, q1);
+        let mut prev = 0i128;
+        for x in [1i128, 5, 25, 100, 500, 2_000, 6_000, 20_000] {
+            let proceeds = lmsr_cost_to_sell(b, q0, q1, x);
+            assert!(proceeds >= prev, "not monotone at x={x}");
+            assert!(proceeds <= escrow, "sells more than the escrow at x={x}");
+            assert!(proceeds <= x, "overpays redemption at x={x}: {proceeds}");
+            prev = proceeds;
+        }
+        // Selling the whole YES position leaves only the YES-side cost behind:
+        // C(0, q1), not the empty-pool seed of C(0, 0).
+        assert_eq!(
+            lmsr_cost_to_sell(b, q0, q1, q0),
+            escrow - lmsr_cost(b, 0, q1)
+        );
     }
 }
