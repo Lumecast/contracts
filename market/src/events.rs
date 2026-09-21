@@ -29,6 +29,21 @@ pub struct BuySharesEvent {
     pub shares_out: i128,
 }
 
+/// Emitted when a holder sells shares back to an LMSR market. `shares_in` is
+/// what was redeemed and `amount_out` the escrow released (opposite of
+/// `BuySharesEvent`).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SellSharesEvent {
+    #[topic]
+    pub market_id: u64,
+    #[topic]
+    pub outcome_index: u32,
+    pub from: Address,
+    pub amount_out: i128,
+    pub shares_in: i128,
+}
+
 /// Emitted when a depositor buys shares in an outcome (token enters escrow).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]

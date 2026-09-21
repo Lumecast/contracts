@@ -16,8 +16,8 @@ use soroban_sdk::{
 };
 
 use lumecast_pricing::{
-    lmsr_cost_to_buy, lmsr_seed, lmsr_shares_affordable, pari_mutuel_payout, PricingModel,
-    LMSR_B_MAX,
+    lmsr_cost_to_buy, lmsr_cost_to_sell, lmsr_seed, lmsr_shares_affordable, pari_mutuel_payout,
+    PricingModel, LMSR_B_MAX,
 };
 use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
@@ -35,7 +35,7 @@ mod types;
 pub use error::Error;
 pub use events::{
     BuySharesEvent, CancelMarketEvent, ClaimEvent, CreateMarketEvent, DepositEvent, DisputeEvent,
-    FinalizeEvent, ProposeEvent, VoteEvent,
+    FinalizeEvent, ProposeEvent, SellSharesEvent, VoteEvent,
 };
 pub use storage::DataKey;
 pub use types::{CreateMarketParameter, Market, MarketState, Outcome, Position, OUTCOME_COUNT};
@@ -289,12 +289,13 @@ impl MarketContract {
             panic_with_error!(&env, Error::AfterClose);
         }
 
-        let q0 = market.shares.get(0).unwrap_or(0);
-        let q1 = market.shares.get(1).unwrap_or(0);
-        let shares_out = lmsr_shares_affordable(market.b, q0, q1, amount_in);
-
         let idx = outcome.index();
-        let pay = lmsr_cost_to_buy(market.b, q0, q1, shares_out);
+        // The pricing module trades "outcome 0" of the pair; orient it around
+        // the requested outcome so YES and NO are priced symmetrically.
+        let q_self = market.shares.get(idx).unwrap_or(0);
+        let q_other = market.shares.get(1 - idx).unwrap_or(0);
+        let shares_out = lmsr_shares_affordable(market.b, q_self, q_other, amount_in);
+        let pay = lmsr_cost_to_buy(market.b, q_self, q_other, shares_out);
 
         // Pull exactly the marginal cost of the batch into escrow.
         let token = token::TokenClient::new(&env, &market.asset);
@@ -328,6 +329,75 @@ impl MarketContract {
         .publish(&env);
 
         position
+    }
+
+    /// Sell `shares_in` of `outcome` back to an LMSR market, releasing
+    /// `C(q0, q1) - C(q0 - x, q1)` from escrow.
+    ///
+    /// Sellers may unwind their position right up until resolution proposes
+    /// (state is still `Open`), *including past `close_ts`* — the close only
+    /// gates new exposure via `buy_shares`/`deposit`, not exits. The holder
+    /// must own at least `shares_in`; the escrow is debited by exactly the
+    /// marginal cost of the redeemed batch, keeping `cash == C(q)` intact.
+    /// Only LMSR markets support selling (pari-mutuel exits via `cancel`).
+    ///
+    /// Returns the proceeds paid out.
+    pub fn sell_shares(
+        env: Env,
+        market_id: u64,
+        from: Address,
+        outcome: Outcome,
+        shares_in: i128,
+    ) -> i128 {
+        from.require_auth();
+
+        if shares_in <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        let mut market = must_get_market(&env, market_id);
+        if market.pricing_model() != PricingModel::Lmsr {
+            panic_with_error!(&env, Error::PricingModelMismatch);
+        }
+        if market.state != MarketState::Open {
+            panic_with_error!(&env, Error::MarketNotOpen);
+        }
+
+        let mut position = read_position(&env, market_id, &from, outcome);
+        if position.shares < shares_in {
+            panic_with_error!(&env, Error::InsufficientShares);
+        }
+
+        let idx = outcome.index();
+        // Orient the pricing pair around the traded outcome (see `buy_shares`).
+        let q_self = market.shares.get(idx).unwrap_or(0);
+        let q_other = market.shares.get(1 - idx).unwrap_or(0);
+        let proceeds = lmsr_cost_to_sell(market.b, q_self, q_other, shares_in);
+
+        // Release exactly the marginal cost of the redeemed batch.
+        let token = token::TokenClient::new(&env, &market.asset);
+        let to = MuxedAddress::from(&from);
+        token.transfer(&env.current_contract_address(), &to, &proceeds);
+
+        market.shares.set(idx, q_self - shares_in);
+        market
+            .pool
+            .set(0, market.pool.get(0).unwrap_or(0) - proceeds);
+        write_market(&env, &market);
+
+        position.shares -= shares_in;
+        write_position(&env, &position);
+
+        SellSharesEvent {
+            market_id,
+            outcome_index: idx,
+            from: from.clone(),
+            amount_out: proceeds,
+            shares_in,
+        }
+        .publish(&env);
+
+        proceeds
     }
 
     /// Read a holder's position in a market/outcome.
@@ -1118,6 +1188,143 @@ mod tests {
             let client = deploy(&env);
             let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, 10_000);
             client.deposit(&market_id, &alice, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn buy_shares_prices_no_mirroring_yes() {
+        // Own-outcome pricing must be symmetric: buying NO from a fresh pool
+        // costs exactly what buying YES costs (the cost functions trade the
+        // pair's "outcome zero", so the contract must orient q around the
+        // requested outcome).
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let (market_id, _usdc, alice, seed) = lmsr_fixture(&env, &client, b);
+
+        client.buy_shares(&market_id, &alice, &Outcome::No, &1_000);
+        let market = client.market(&market_id).unwrap();
+        let pay_no = market.pool.get(0).unwrap() - seed;
+        let x_no = market.shares.get(1).unwrap();
+
+        assert_eq!(pay_no, lmsr_cost_to_buy(b, 0, 0, x_no));
+        assert_eq!(market.shares.get(0).unwrap(), 0);
+        assert!(pay_no > 0);
+    }
+
+    #[test]
+    fn sell_shares_reduces_position_and_releases_escrow() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let (market_id, usdc, alice, seed) = lmsr_fixture(&env, &client, b);
+        let token = token::TokenClient::new(&env, &usdc);
+
+        client.buy_shares(&market_id, &alice, &Outcome::Yes, &2_000);
+        let market = client.market(&market_id).unwrap();
+        let pay = market.pool.get(0).unwrap() - seed;
+        let x = market.shares.get(0).unwrap();
+
+        let before = token.balance(&alice);
+        let proceeds = client.sell_shares(&market_id, &alice, &Outcome::Yes, &x);
+        assert!(proceeds > 0);
+
+        let market = client.market(&market_id).unwrap();
+        // Selling back everything returns the escrow to C(0, 0) = seed; the
+        // proceeds are the mirror-image cost of the original batch.
+        assert_eq!(market.shares.get(0).unwrap(), 0);
+        assert_eq!(market.pool.get(0).unwrap(), seed);
+        assert_eq!(market.total_pool(), seed);
+        assert_eq!(token.balance(&alice), before + proceeds);
+        assert_eq!(client.position(&market_id, &alice, &Outcome::Yes).shares, 0);
+        assert_eq!(proceeds, pay);
+    }
+
+    #[test]
+    fn sell_shares_partial_unwind_keeps_escrow_invariant() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let b = 10_000i128;
+        let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, b);
+
+        client.buy_shares(&market_id, &alice, &Outcome::Yes, &2_000);
+        let market = client.market(&market_id).unwrap();
+        let x = market.shares.get(0).unwrap();
+
+        let half = x / 2;
+        let _proceeds = client.sell_shares(&market_id, &alice, &Outcome::Yes, &half);
+
+        let market = client.market(&market_id).unwrap();
+        let q0 = market.shares.get(0).unwrap();
+        let q1 = market.shares.get(1).unwrap();
+        assert_eq!(q0, x - half);
+        // cash == C(q) exactly after the debit.
+        assert_eq!(
+            market.pool.get(0).unwrap(),
+            lumecast_pricing::lmsr_cost(b, q0, q1)
+        );
+        assert!(market.total_pool() >= q0.max(q1));
+        assert_eq!(
+            client.position(&market_id, &alice, &Outcome::Yes).shares,
+            q0
+        );
+    }
+
+    #[test]
+    fn sell_shares_after_close_unwinds_position() {
+        let env = Env::default();
+        let client = deploy(&env);
+        let (market_id, usdc, alice, seed) = lmsr_fixture(&env, &client, 10_000);
+        let token = token::TokenClient::new(&env, &usdc);
+        let before = token.balance(&alice);
+
+        client.buy_shares(&market_id, &alice, &Outcome::No, &2_000);
+        let held = client.position(&market_id, &alice, &Outcome::No).shares;
+        // Close: buys are rejected, sells still unwind the position.
+        env.ledger().set_timestamp(1_700_000_001);
+
+        let _proceeds = client.sell_shares(&market_id, &alice, &Outcome::No, &held);
+        let market = client.market(&market_id).unwrap();
+        // Selling everything back restores the escrow to C(0, 0) = seed and the
+        // balance to where it started (buy and sell round-trip the same
+        // marginal cost).
+        assert_eq!(market.pool.get(0).unwrap(), seed);
+        assert_eq!(market.shares.get(1).unwrap(), 0);
+        assert_eq!(token.balance(&alice), before);
+        assert_eq!(client.position(&market_id, &alice, &Outcome::No).shares, 0);
+    }
+
+    #[test]
+    fn sell_shares_more_than_held_is_rejected() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, 10_000);
+            client.buy_shares(&market_id, &alice, &Outcome::Yes, &1_000);
+            client.sell_shares(&market_id, &alice, &Outcome::Yes, &1_000_000)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sell_shares_without_a_position_is_rejected() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let (market_id, _usdc, alice, _seed) = lmsr_fixture(&env, &client, 10_000);
+            client.sell_shares(&market_id, &alice, &Outcome::Yes, &1)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sell_shares_rejects_pari_mutuel_market() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let env = Env::default();
+            let client = deploy(&env);
+            let funded = funded_market(&env, &client);
+            client.sell_shares(&funded.market_id, &funded.alice, &Outcome::Yes, &1)
         }));
         assert!(result.is_err());
     }
