@@ -6,6 +6,7 @@
 use lumecast_market::{
     CreateMarketParameter, MarketContract, MarketContractClient, MarketState, Outcome,
 };
+use lumecast_pricing::lmsr_marginal_price;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
@@ -185,4 +186,88 @@ fn resolve_dispute_vote_and_claim_pay_out_winners() {
 fn usdc_admin_mint_for(env: &Env, usdc: &Address, who: &Address, amount: i128, spender: &Address) {
     StellarAssetClient::new(env, usdc).mint(who, &amount);
     TokenClient::new(env, usdc).approve(who, spender, &i128::MAX, &100_000);
+}
+
+fn setup_lmsr(env: &Env, b: i128) -> Players {
+    let mut p = setup(env);
+    p.market_id = p.client.create_market(
+        &p.alice,
+        &CreateMarketParameter {
+            resolver: p.resolver.clone(),
+            asset: p.usdc.clone(),
+            question: String::from_str(env, "Will Lumecast launch its first market on Mainnet?"),
+            close_ts: 1_700_000_000,
+            resolution_ts: 1_700_086_400,
+            b,
+        },
+    );
+    p
+}
+
+/// End-to-end LMSR lifecycle across the whole stack: seed liquidity buys a
+/// curve, marginal pricing is consistent, resolution sweeps surplus to the
+/// creator, and winning claims are strictly one-for-one.
+#[test]
+fn lmsr_lifecycle_seeds_buys_resolves_and_claims_one_to_one() {
+    let env = Env::default();
+    let p = setup_lmsr(&env, 10_000);
+    let token = TokenClient::new(&env, &p.usdc);
+
+    // Both sides trade against the seeded curve; the escrow exactly matches
+    // the LMSR cost function and prices complement to 1.0 (within one unit of
+    // fixed-point floor).
+    p.client
+        .buy_shares(&p.market_id, &p.bob, &Outcome::Yes, &100_000);
+    let yes_after_buy = token.balance(&p.bob);
+    assert!(yes_after_buy < 1_000_000); // bob actually paid for shares
+    p.client
+        .buy_shares(&p.market_id, &p.carol, &Outcome::No, &50_000);
+    let market = p.client.market(&p.market_id).unwrap();
+    let q_yes = market.shares.get(0).unwrap();
+    let q_no = market.shares.get(1).unwrap();
+    assert_eq!(
+        market.total_pool(),
+        lumecast_pricing::lmsr_cost(10_000, q_yes, q_no)
+    );
+    let p_yes = p.client.price(&p.market_id, &Outcome::Yes);
+    let p_no = p.client.price(&p.market_id, &Outcome::No);
+    assert_eq!(p_yes, lmsr_marginal_price(10_000, q_yes, q_no));
+    assert_eq!(p_no, lmsr_marginal_price(10_000, q_no, q_yes));
+    assert!(p_yes + p_no >= 9_999 && p_yes + p_no <= 10_000);
+    assert!(p_yes > p_no);
+
+    // Baselines recorded after trading so deltas only measure resolution.
+    let creator_after_buys = token.balance(&p.alice);
+    let no_after_buys = token.balance(&p.carol);
+    let pool_after_buys = market.total_pool();
+
+    // Resolve uncontested beyond the dispute window; YES wins its share count.
+    env.ledger().set_timestamp(1_700_086_401);
+    usdc_admin_mint_for(&env, &p.usdc, &p.resolver, 10_000, &p.client.address);
+    p.client
+        .propose_outcome(&p.market_id, &p.resolver, &Outcome::Yes, &10_000);
+    env.ledger().set_sequence_number(
+        env.ledger().sequence() + lumecast_resolution::DISPUTE_WINDOW_LEDGERS + 1,
+    );
+    p.client.finalize(&p.market_id);
+
+    let market = p.client.market(&p.market_id).unwrap();
+    // The final market's q_yes is exactly the shares bob bought (carol only
+    // ever holds No), and the pool has been trimmed to that coverage.
+    assert_eq!(market.shares.get(0).unwrap(), q_yes);
+    assert_eq!(market.state, MarketState::Resolved(Outcome::Yes));
+    assert_eq!(market.total_pool(), q_yes);
+
+    // Winner claims exactly the winning coverage at 1:1; creator's sweep is
+    // the seeded surplus; the losing side is untouched; escrow empties.
+    let yes_payout = p.client.claim(&p.market_id, &p.bob, &Outcome::Yes);
+    assert_eq!(yes_payout, q_yes);
+    assert_eq!(token.balance(&p.bob), yes_after_buy + q_yes);
+    assert_eq!(
+        token.balance(&p.alice) - creator_after_buys,
+        pool_after_buys - q_yes
+    );
+    assert_eq!(token.balance(&p.carol), no_after_buys);
+    assert_eq!(p.client.claim(&p.market_id, &p.carol, &Outcome::No), 0);
+    assert_eq!(token.balance(&p.client.address), 0);
 }

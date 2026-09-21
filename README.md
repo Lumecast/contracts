@@ -125,17 +125,21 @@ See `scripts/` for wrapped versions of common deploy/invoke flows.
 
 | Function | Description |
 |---|---|
-| `create_market(question, close_ts, resolution_ts, resolver, asset)` | Opens a new market |
-| `deposit(market_id, outcome, amount)` | Buy shares in an outcome |
-| `cancel_market(market_id)` | Refund all participants if a market can't be resolved fairly |
+| `create_market(creator, params: CreateMarketParameter)` | Opens a new market; `b: i128` selects LMSR (`b > 0`) vs pari-mutuel (`b == 0`) via `resolver, asset, question, close_ts, resolution_ts, b` |
+| `deposit(market_id, outcome, amount)` | Pari-mutuel: buy shares in an outcome |
+| `buy_shares(market_id, buyer, outcome, budget)` | LMSR: buy with a spend budget, priced at the marginal cost on the curve |
+| `sell_shares(market_id, seller, outcome, shares)` | LMSR: unwind positions at the marginal price (allowed after close while open) |
+| `price(market_id, outcome)` | LMSR: current marginal price (fixed point, 10,000 = 1.0); complement sum stays in `[ONE-1, ONE]` |
+| `cancel_market(market_id)` | Refund all participants if a market can't be resolved fairly (pari-mutuel only) |
 | `propose_outcome(market_id, outcome, bond)` | Resolver proposes the final outcome with an escrowed bond |
 | `dispute(market_id, counter_bond)` | Challenge a proposed outcome within the dispute window |
 | `vote(market_id, outcome)` | Committee member casts (or replaces) a vote on a disputed market |
-| `finalize(market_id)` | Locks in the outcome and settles / slashes bonds |
-| `claim(market_id, outcome)` | Withdraw winnings post-resolution (pari-mutuel) |
+| `finalize(market_id)` | Locks in the outcome and settles / slashes bonds; LMSR sweeps surplus liquidity to the creator and pays winners 1:1, pari-mutuel pays pro-rata |
+| `claim(market_id, outcome)` | Withdraw winnings post-resolution |
 
-Events: `CreateMarketEvent`, `DepositEvent`, `CancelMarketEvent`,
-`ProposeEvent`, `DisputeEvent`, `VoteEvent`, `FinalizeEvent`, `ClaimEvent`.
+Events: `CreateMarketEvent`, `DepositEvent`, `BuySharesEvent`, `SellSharesEvent`,
+`CancelMarketEvent`, `ProposeEvent`, `DisputeEvent`, `VoteEvent`, `FinalizeEvent`,
+`ClaimEvent`.
 
 Full parameter types and events are documented in `docs/interface.md` (generated from contract doc comments).
 
