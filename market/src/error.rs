@@ -56,4 +56,9 @@ pub enum Error {
     LmsrNotCancellable = 23,
     /// The holder does not own enough shares to sell.
     InsufficientShares = 24,
+    /// Reentrancy detected: an external call was made while already inside a
+    /// guarded section.
+    ReentrancyDetected = 25,
+    /// Contract is paused; no state-changing operations allowed.
+    ContractPaused = 26,
 }

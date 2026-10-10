@@ -3,6 +3,7 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 use crate::error::Error;
 use crate::types::{Market, Outcome, Position};
 use lumecast_resolution::{GovernanceConfig, Resolution};
+use soroban_sdk::panic_with_error;
 
 /// Persistent storage keys for the market contract.
 ///
@@ -22,6 +23,10 @@ pub enum DataKey {
     Governance,
     /// Per-market resolution state (proposal + challenges + votes).
     Resolution(u64),
+    /// Reentrancy guard flag - true when inside an external call.
+    ReentrancyGuard,
+    /// Circuit breaker / pause flag - true when contract is paused.
+    Paused,
 }
 
 /// Instance TTL bump applied on every write so active markets stay alive
@@ -165,4 +170,43 @@ pub fn remove_resolution(env: &Env, market_id: u64) {
     env.storage()
         .instance()
         .remove(&DataKey::Resolution(market_id));
+}
+
+/// Check if the contract is paused.
+pub fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+/// Set the pause state (admin only).
+pub fn set_paused(env: &Env, paused: bool) {
+    env.storage().instance().set(&DataKey::Paused, &paused);
+    bump_instance(env);
+}
+
+/// Enter a reentrancy-guarded section. Panics if already inside a guarded
+/// section (i.e., reentrancy detected).
+pub fn enter_reentrancy_guard(env: &Env) {
+    let guard: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    if guard {
+        panic_with_error!(env, Error::ReentrancyDetected);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &true);
+    bump_instance(env);
+}
+
+/// Exit a reentrancy-guarded section.
+pub fn exit_reentrancy_guard(env: &Env) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &false);
+    bump_instance(env);
 }

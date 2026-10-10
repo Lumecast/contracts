@@ -125,3 +125,19 @@ pub struct ClaimEvent {
     pub claimant: Address,
     pub amount: i128,
 }
+
+/// Emitted when the contract is paused by the admin.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseEvent {
+    #[topic]
+    pub paused_by: Address,
+}
+
+/// Emitted when the contract is unpaused by the admin.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnpauseEvent {
+    #[topic]
+    pub unpaused_by: Address,
+}

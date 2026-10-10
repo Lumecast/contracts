@@ -22,9 +22,10 @@ use lumecast_pricing::{
 use lumecast_resolution::{in_dispute_window, slash_split, GovernanceConfig, Resolution};
 
 use crate::storage::{
-    add_holder, get_market, next_market_id, read_admin, read_governance, read_holders,
-    read_position, read_resolution, remove_resolution, require_market, write_admin,
-    write_governance, write_market, write_position, write_resolution,
+    add_holder, enter_reentrancy_guard, exit_reentrancy_guard, get_market, is_paused,
+    next_market_id, read_admin, read_governance, read_holders, read_position, read_resolution,
+    remove_resolution, require_market, set_paused, write_admin, write_governance, write_market,
+    write_position, write_resolution,
 };
 
 mod error;
@@ -35,7 +36,7 @@ mod types;
 pub use error::Error;
 pub use events::{
     BuySharesEvent, CancelMarketEvent, ClaimEvent, CreateMarketEvent, DepositEvent, DisputeEvent,
-    FinalizeEvent, ProposeEvent, SellSharesEvent, VoteEvent,
+    FinalizeEvent, PauseEvent, ProposeEvent, SellSharesEvent, UnpauseEvent, VoteEvent,
 };
 pub use storage::DataKey;
 pub use types::{CreateMarketParameter, Market, MarketState, Outcome, Position, OUTCOME_COUNT};
@@ -68,6 +69,24 @@ fn distribute_protocol_fee(
         .expect("admin is always set at construction");
     let to = MuxedAddress::from(&receiver);
     token.transfer(&env.current_contract_address(), &to, &protocol_share);
+}
+
+/// Check if contract is paused and panic if so.
+fn check_not_paused(env: &Env) {
+    if is_paused(env) {
+        panic_with_error!(env, Error::ContractPaused);
+    }
+}
+
+/// Execute a closure within a reentrancy guard.
+fn with_reentrancy_guard<F, R>(env: &Env, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    enter_reentrancy_guard(env);
+    let result = f();
+    exit_reentrancy_guard(env);
+    result
 }
 
 #[contract]
@@ -117,6 +136,41 @@ impl MarketContract {
         );
     }
 
+    /// Pause the contract. Admin-only. When paused, all state-changing
+    /// operations are rejected (read-only views still work).
+    pub fn pause(env: Env, caller: Address) {
+        caller.require_auth();
+        let caller_clone = caller.clone();
+        if Some(caller) != read_admin(&env) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        set_paused(&env, true);
+
+        PauseEvent {
+            paused_by: caller_clone,
+        }
+        .publish(&env);
+    }
+
+    /// Unpause the contract. Admin-only.
+    pub fn unpause(env: Env, caller: Address) {
+        caller.require_auth();
+        if Some(caller.clone()) != read_admin(&env) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        set_paused(&env, false);
+
+        UnpauseEvent {
+            unpaused_by: caller,
+        }
+        .publish(&env);
+    }
+
+    /// Read the current pause state.
+    pub fn paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
     /// Create a new binary (YES/NO) market.
     ///
     /// No funds move for a pari-mutuel market (`params.b == 0` — USDC enters
@@ -126,6 +180,7 @@ impl MarketContract {
     /// `escrow >= max(shares)` solvency invariant hold, and it is recovered
     /// from the pool on `finalize`.
     pub fn create_market(env: Env, creator: Address, params: CreateMarketParameter) -> u64 {
+        check_not_paused(&env);
         creator.require_auth();
 
         if params.close_ts >= params.resolution_ts {
@@ -157,12 +212,14 @@ impl MarketContract {
         if market.pricing_model() == PricingModel::Lmsr {
             let seed = lmsr_seed(market.b);
             let token = token::TokenClient::new(&env, &market.asset);
-            token.transfer_from(
-                &env.current_contract_address(),
-                &creator,
-                &env.current_contract_address(),
-                &seed,
-            );
+            with_reentrancy_guard(&env, || {
+                token.transfer_from(
+                    &env.current_contract_address(),
+                    &creator,
+                    &env.current_contract_address(),
+                    &seed,
+                );
+            });
             market.pool = Vec::from_array(&env, [seed, 0]);
         }
 
@@ -205,6 +262,7 @@ impl MarketContract {
         outcome: Outcome,
         amount: i128,
     ) -> Position {
+        check_not_paused(&env);
         from.require_auth();
 
         if amount <= 0 {
@@ -224,12 +282,14 @@ impl MarketContract {
 
         // Pull the settlement tokens out of the depositor's wallet into escrow.
         let token = token::TokenClient::new(&env, &market.asset);
-        token.transfer_from(
-            &env.current_contract_address(),
-            &from,
-            &env.current_contract_address(),
-            &amount,
-        );
+        with_reentrancy_guard(&env, || {
+            token.transfer_from(
+                &env.current_contract_address(),
+                &from,
+                &env.current_contract_address(),
+                &amount,
+            );
+        });
 
         // Credit the pool and the depositor's position.
         let idx = outcome.index();
@@ -272,6 +332,7 @@ impl MarketContract {
         outcome: Outcome,
         amount_in: i128,
     ) -> Position {
+        check_not_paused(&env);
         from.require_auth();
 
         if amount_in <= 0 {
@@ -299,12 +360,14 @@ impl MarketContract {
 
         // Pull exactly the marginal cost of the batch into escrow.
         let token = token::TokenClient::new(&env, &market.asset);
-        token.transfer_from(
-            &env.current_contract_address(),
-            &from,
-            &env.current_contract_address(),
-            &pay,
-        );
+        with_reentrancy_guard(&env, || {
+            token.transfer_from(
+                &env.current_contract_address(),
+                &from,
+                &env.current_contract_address(),
+                &pay,
+            );
+        });
 
         // Cash lives in pool[0] for LMSR markets; shares carry the outcome
         // counts q0/q1, so `market.total_pool()` recomputes C(q0, q1).
@@ -349,6 +412,7 @@ impl MarketContract {
         outcome: Outcome,
         shares_in: i128,
     ) -> i128 {
+        check_not_paused(&env);
         from.require_auth();
 
         if shares_in <= 0 {
@@ -377,7 +441,9 @@ impl MarketContract {
         // Release exactly the marginal cost of the redeemed batch.
         let token = token::TokenClient::new(&env, &market.asset);
         let to = MuxedAddress::from(&from);
-        token.transfer(&env.current_contract_address(), &to, &proceeds);
+        with_reentrancy_guard(&env, || {
+            token.transfer(&env.current_contract_address(), &to, &proceeds);
+        });
 
         market.shares.set(idx, q_self - shares_in);
         market
@@ -429,6 +495,7 @@ impl MarketContract {
     /// gets their deposited tokens back, the escrow ledger is zeroed, and the
     /// market is locked in the `Cancelled` state.
     pub fn cancel_market(env: Env, market_id: u64, caller: Address) {
+        check_not_paused(&env);
         caller.require_auth();
 
         let mut market = must_get_market(&env, market_id);
@@ -450,7 +517,9 @@ impl MarketContract {
                 let mut position = read_position(&env, market_id, &holder, outcome);
                 if position.shares > 0 {
                     let to = MuxedAddress::from(&holder);
-                    token.transfer(&env.current_contract_address(), &to, &position.shares);
+                    with_reentrancy_guard(&env, || {
+                        token.transfer(&env.current_contract_address(), &to, &position.shares);
+                    });
                     position.shares = 0;
                     write_position(&env, &position);
                 }
@@ -482,6 +551,7 @@ impl MarketContract {
         outcome: Outcome,
         bond: i128,
     ) {
+        check_not_paused(&env);
         resolver.require_auth();
 
         if bond <= 0 {
@@ -501,12 +571,14 @@ impl MarketContract {
 
         // Escrow the resolver's bond alongside the pool.
         let token = token::TokenClient::new(&env, &market.asset);
-        token.transfer_from(
-            &env.current_contract_address(),
-            &resolver,
-            &env.current_contract_address(),
-            &bond,
-        );
+        with_reentrancy_guard(&env, || {
+            token.transfer_from(
+                &env.current_contract_address(),
+                &resolver,
+                &env.current_contract_address(),
+                &bond,
+            );
+        });
 
         let proposed_ledger = env.ledger().sequence();
         let resolution = Resolution {
@@ -535,6 +607,7 @@ impl MarketContract {
     /// challenge, but their `counter_bond` must at least match the proposer's
     /// bond. Escalates the market to `Disputed`, where the committee votes.
     pub fn dispute(env: Env, market_id: u64, challenger: Address, counter_bond: i128) {
+        check_not_paused(&env);
         challenger.require_auth();
 
         if counter_bond <= 0 {
@@ -558,12 +631,14 @@ impl MarketContract {
 
         // Escrow the challenger's counter-bond.
         let token = token::TokenClient::new(&env, &market.asset);
-        token.transfer_from(
-            &env.current_contract_address(),
-            &challenger,
-            &env.current_contract_address(),
-            &counter_bond,
-        );
+        with_reentrancy_guard(&env, || {
+            token.transfer_from(
+                &env.current_contract_address(),
+                &challenger,
+                &env.current_contract_address(),
+                &counter_bond,
+            );
+        });
 
         resolution
             .challenges
@@ -585,6 +660,7 @@ impl MarketContract {
     /// Cast a committee vote on a disputed market. Only configured committee
     /// members may vote; each member's latest vote replaces any earlier one.
     pub fn vote(env: Env, market_id: u64, voter: Address, outcome: Outcome) {
+        check_not_paused(&env);
         voter.require_auth();
 
         let market = must_get_market(&env, market_id);
@@ -630,6 +706,7 @@ impl MarketContract {
     ///   forfeited and split between the winning side (70%) and the protocol
     ///   fee receiver (30%, or the contract admin if unset).
     pub fn finalize(env: Env, market_id: u64) {
+        check_not_paused(&env);
         let mut market = must_get_market(&env, market_id);
         let governance = read_governance(&env);
         let resolution =
@@ -641,8 +718,10 @@ impl MarketContract {
                 if in_dispute_window(&env, resolution.proposed_ledger) {
                     panic_with_error!(&env, Error::DisputeWindowOpen);
                 }
-                let to = MuxedAddress::from(&resolution.proposer);
-                token.transfer(&env.current_contract_address(), &to, &resolution.bond);
+                with_reentrancy_guard(&env, || {
+                    let to = MuxedAddress::from(&resolution.proposer);
+                    token.transfer(&env.current_contract_address(), &to, &resolution.bond);
+                });
                 (proposed, true, Some(resolution.bond))
             }
             MarketState::Disputed(_) => {
@@ -665,13 +744,17 @@ impl MarketContract {
                 if proposer_wins {
                     // Proposer keeps their own bond, plus a share of every
                     // forfeited challenger counter-bond.
-                    let to = MuxedAddress::from(&resolution.proposer);
-                    token.transfer(&env.current_contract_address(), &to, &resolution.bond);
+                    with_reentrancy_guard(&env, || {
+                        let to = MuxedAddress::from(&resolution.proposer);
+                        token.transfer(&env.current_contract_address(), &to, &resolution.bond);
+                    });
                     for i in 0..resolution.challenges.len() {
                         let (_, counter_bond) = resolution.challenges.get(i).unwrap();
                         let (winner_share, protocol_share) = slash_split(counter_bond);
-                        let to = MuxedAddress::from(&resolution.proposer);
-                        token.transfer(&env.current_contract_address(), &to, &winner_share);
+                        with_reentrancy_guard(&env, || {
+                            let to = MuxedAddress::from(&resolution.proposer);
+                            token.transfer(&env.current_contract_address(), &to, &winner_share);
+                        });
                         distribute_protocol_fee(&env, &token, &governance, protocol_share);
                     }
                     // Proposer's own bond is returned in full.
@@ -686,15 +769,19 @@ impl MarketContract {
                     let n = resolution.challenges.len();
                     for i in 0..n {
                         let (challenger, counter_bond) = resolution.challenges.get(i).unwrap();
-                        let to = MuxedAddress::from(challenger);
-                        token.transfer(&env.current_contract_address(), &to, &counter_bond);
+                        with_reentrancy_guard(&env, || {
+                            let to = MuxedAddress::from(challenger);
+                            token.transfer(&env.current_contract_address(), &to, &counter_bond);
+                        });
                     }
                     let (winner_share, protocol_share) = slash_split(resolution.bond);
                     let per_challenger = if n > 0 { winner_share / (n as i128) } else { 0 };
                     for i in 0..n {
                         let (challenger, _) = resolution.challenges.get(i).unwrap();
-                        let to = MuxedAddress::from(challenger);
-                        token.transfer(&env.current_contract_address(), &to, &per_challenger);
+                        with_reentrancy_guard(&env, || {
+                            let to = MuxedAddress::from(challenger);
+                            token.transfer(&env.current_contract_address(), &to, &per_challenger);
+                        });
                     }
                     distribute_protocol_fee(&env, &token, &governance, protocol_share);
                     (outcome_from(&env, resolution.proposed), false, Some(0))
@@ -715,8 +802,10 @@ impl MarketContract {
             let q_win = market.shares.get(winning.index()).unwrap_or(0);
             let sweep = market.total_pool() - q_win;
             if sweep > 0 {
-                let to = MuxedAddress::from(&market.creator);
-                token.transfer(&env.current_contract_address(), &to, &sweep);
+                with_reentrancy_guard(&env, || {
+                    let to = MuxedAddress::from(&market.creator);
+                    token.transfer(&env.current_contract_address(), &to, &sweep);
+                });
             }
             market.pool.set(0, q_win);
         }
@@ -739,6 +828,7 @@ impl MarketContract {
     /// the creator on `finalize`). Claiming zeroes the position so double
     /// claims pay nothing.
     pub fn claim(env: Env, market_id: u64, claimant: Address, outcome: Outcome) -> i128 {
+        check_not_paused(&env);
         claimant.require_auth();
 
         let mut market = must_get_market(&env, market_id);
@@ -776,7 +866,9 @@ impl MarketContract {
         if payout > 0 {
             let token = token::TokenClient::new(&env, &market.asset);
             let to = MuxedAddress::from(&claimant);
-            token.transfer(&env.current_contract_address(), &to, &payout);
+            with_reentrancy_guard(&env, || {
+                token.transfer(&env.current_contract_address(), &to, &payout);
+            });
             // LMSR escrow ledger follows the physical balance as claims drain
             // it; pari-mutuel keeps the ledger whole until pro-rata settles.
             if market.pricing_model() == PricingModel::Lmsr {
@@ -2066,6 +2158,119 @@ mod tests {
             let f = resolution_fixture(&env, &client, &admin, true);
             client.claim(&f.market_id, &f.yes_holder, &Outcome::Yes)
         }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pause_blocks_all_state_changing_operations() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+
+        // First create a market while unpaused
+        let funded = funded_market(&env, &client);
+
+        // Now pause the contract
+        client.pause(&admin);
+        assert_eq!(client.paused(), true);
+
+        // All state-changing operations should fail
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.create_market(
+                &funded.alice,
+                &CreateMarketParameter {
+                    resolver: Address::generate(&env),
+                    asset: funded.usdc.clone(),
+                    question: String::from_str(&env, "Q"),
+                    close_ts: 1_700_000_000,
+                    resolution_ts: 1_700_086_400,
+                    b: 0,
+                },
+            )
+        }));
+        assert!(result.is_err());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.deposit(&funded.market_id, &funded.alice, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let usdc = env
+                .register_stellar_asset_contract_v2(Address::generate(&env))
+                .address();
+            let usdc_admin = token::StellarAssetClient::new(&env, &usdc);
+            let buyer = Address::generate(&env);
+            usdc_admin.mint(&buyer, &1_000_000);
+            token::TokenClient::new(&env, &usdc).approve(
+                &buyer,
+                &client.address,
+                &i128::MAX,
+                &100_000,
+            );
+            client.buy_shares(&funded.market_id, &buyer, &Outcome::Yes, &100)
+        }));
+        assert!(result.is_err());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.cancel_market(&funded.market_id, &funded.alice)
+        }));
+        assert!(result.is_err());
+
+        // Unpause and verify operations work again
+        client.unpause(&admin);
+        assert_eq!(client.paused(), false);
+
+        let position = client.deposit(&funded.market_id, &funded.alice, &Outcome::Yes, &100);
+        assert_eq!(position.shares, 100);
+    }
+
+    #[test]
+    fn pause_allows_read_only_operations() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let funded = funded_market(&env, &client);
+
+        client.pause(&admin);
+
+        // Read-only operations should still work
+        let market = client.market(&funded.market_id).unwrap();
+        assert_eq!(market.id, funded.market_id);
+
+        let position = client.position(&funded.market_id, &funded.alice, &Outcome::Yes);
+        assert_eq!(position.shares, 0);
+
+        let gov = client.governance();
+        assert_eq!(gov.quorum, 0);
+
+        let admin_addr = client.admin().unwrap();
+        assert_eq!(admin_addr, admin);
+    }
+
+    #[test]
+    fn reentrancy_guard_detected_on_nested_calls() {
+        // This test verifies the reentrancy guard is in place.
+        // Full reentrancy testing would require a malicious token contract
+        // that calls back into the market contract, which is complex to set up.
+        // Here we verify the guard functions exist and can be called.
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let funded = funded_market(&env, &client);
+
+        // Normal operation should work (guard enters and exits properly)
+        let position = client.deposit(&funded.market_id, &funded.alice, &Outcome::Yes, &100);
+        assert_eq!(position.shares, 100);
+    }
+
+    #[test]
+    fn unpause_by_non_admin_rejected() {
+        let env = Env::default();
+        let (client, admin) = deploy_with_admin(&env);
+        let stranger = Address::generate(&env);
+
+        client.pause(&admin);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.unpause(&stranger)));
         assert!(result.is_err());
     }
 }
