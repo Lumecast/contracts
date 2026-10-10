@@ -513,4 +513,235 @@ mod tests {
             escrow - lmsr_cost(b, 0, q1)
         );
     }
+
+    /// Test LMSR with minimum liquidity parameter (b=1)
+    #[test]
+    fn lmsr_min_liquidity_works() {
+        let b = LMSR_B_MIN;
+        let seed = lmsr_seed(b);
+        assert!(seed > 0);
+        // With b=1, prices should be very sensitive
+        let p = lmsr_marginal_price(b, 0, 0);
+        assert!((0..=ONE).contains(&p));
+        // Cost function should still work
+        let cost = lmsr_cost(b, 10, 5);
+        assert!(cost >= 10);
+    }
+
+    /// Test LMSR with maximum liquidity parameter
+    #[test]
+    fn lmsr_max_liquidity_works() {
+        let b = LMSR_B_MAX;
+        let seed = lmsr_seed(b);
+        assert!(seed > 0);
+        // With large b, prices should be very stable near 0.5
+        let p = lmsr_marginal_price(b, 0, 0);
+        assert!((0..=ONE).contains(&p));
+        // Cost function should handle large numbers
+        let cost = lmsr_cost(b, 1_000_000, 500_000);
+        assert!(cost >= 1_000_000);
+    }
+
+    /// Test LMSR round-trip: buy then sell returns to original state (within rounding)
+    #[test]
+    fn lmsr_round_trip_buy_sell() {
+        let b = 10_000;
+        let (mut q0, mut q1) = (5_000, 3_000);
+        let initial_cost = lmsr_cost(b, q0, q1);
+
+        // Buy 1000 shares of outcome 0
+        let buy_amount = 1_000;
+        let cost_to_buy = lmsr_cost_to_buy(b, q0, q1, buy_amount);
+        q0 += buy_amount;
+        let mid_cost = lmsr_cost(b, q0, q1);
+        assert_eq!(mid_cost - initial_cost, cost_to_buy);
+
+        // Sell them back
+        let proceeds = lmsr_cost_to_sell(b, q0, q1, buy_amount);
+        q0 -= buy_amount;
+        let final_cost = lmsr_cost(b, q0, q1);
+        assert_eq!(mid_cost - final_cost, proceeds);
+        assert_eq!(final_cost, initial_cost);
+    }
+
+    /// Test LMSR price bounds under extreme imbalance
+    #[test]
+    fn lmsr_price_bounds_extreme_imbalance() {
+        let b = 1_000;
+        // Very lopsided pool
+        let p0 = lmsr_marginal_price(b, 1_000_000, 0);
+        let p1 = lmsr_marginal_price(b, 0, 1_000_000);
+        assert!(
+            p0 >= ONE - 10,
+            "dominant outcome price should approach 1.0, got {p0}"
+        );
+        assert!(
+            p1 <= 10,
+            "dominated outcome price should approach 0.0, got {p1}"
+        );
+        assert!(p0 + p1 >= ONE - 1 && p0 + p1 <= ONE);
+    }
+
+    /// Test LMSR cost function monotonicity with large numbers
+    #[test]
+    fn lmsr_cost_monotonicity_large_numbers() {
+        let b = 100_000;
+        let base = lmsr_cost(b, 1_000_000, 500_000);
+        // Adding shares should never decrease cost
+        assert!(lmsr_cost(b, 1_000_001, 500_000) >= base);
+        assert!(lmsr_cost(b, 1_000_000, 500_001) >= base);
+        // Adding to the smaller side
+        assert!(lmsr_cost(b, 1_000_000, 500_001) >= lmsr_cost(b, 1_000_000, 500_000));
+    }
+
+    /// Test LMSR shares_affordable with zero and negative budgets
+    #[test]
+    fn lmsr_shares_affordable_edge_cases() {
+        let b = 5_000;
+        // Zero budget
+        assert_eq!(lmsr_shares_affordable(b, 100, 200, 0), 0);
+        // Negative budget
+        assert_eq!(lmsr_shares_affordable(b, 100, 200, -100), 0);
+        // Very small budget at high prices
+        let x = lmsr_shares_affordable(b, 1_000_000, 0, 1);
+        assert!(x <= 1);
+    }
+
+    /// Test LMSR cost_to_buy and cost_to_sell symmetry
+    #[test]
+    fn lmsr_buy_sell_symmetry() {
+        let b = 7_500;
+        let (q0, q1) = (12_000, 8_000);
+        let escrow = lmsr_cost(b, q0, q1);
+
+        // Buy some shares
+        let buy_shares = 500;
+        let buy_cost = lmsr_cost_to_buy(b, q0, q1, buy_shares);
+        let new_q0 = q0 + buy_shares;
+        let new_escrow = lmsr_cost(b, new_q0, q1);
+        assert_eq!(new_escrow, escrow + buy_cost);
+
+        // Sell them back
+        let sell_proceeds = lmsr_cost_to_sell(b, new_q0, q1, buy_shares);
+        let final_escrow = lmsr_cost(b, q0, q1);
+        assert_eq!(new_escrow - sell_proceeds, final_escrow);
+        assert_eq!(final_escrow, escrow);
+        // Buy cost should equal sell proceeds (within rounding)
+        assert!((buy_cost - sell_proceeds).abs() <= 2);
+    }
+
+    /// Test LMSR solvency invariant: C(q0, q1) >= max(q0, q1) for all valid inputs
+    #[test]
+    fn lmsr_solvency_invariant_comprehensive() {
+        let test_cases = [
+            (1, 0, 0),
+            (1, 1, 0),
+            (1, 0, 1),
+            (10, 100, 50),
+            (100, 10_000, 5_000),
+            (1_000, 100_000, 100_000),
+            (10_000, 1_000_000, 0),
+            (10_000, 0, 1_000_000),
+            (100_000, 10_000_000, 5_000_000),
+            (LMSR_B_MAX, 100_000, 50_000),
+        ];
+
+        for (b, q0, q1) in test_cases {
+            let cost = lmsr_cost(b, q0, q1);
+            assert!(
+                cost >= q0.max(q1),
+                "Solvency violated: b={b}, q0={q0}, q1={q1}, cost={cost}, max={}",
+                q0.max(q1)
+            );
+        }
+    }
+
+    /// Test LMSR price complementarity: p0 + p1 = ONE (within 1 unit)
+    #[test]
+    fn lmsr_price_complementarity_comprehensive() {
+        let test_cases = [
+            (1, 0, 0),
+            (10, 100, 50),
+            (100, 10_000, 5_000),
+            (1_000, 100_000, 100_000),
+            (10_000, 1_000_000, 0),
+            (10_000, 0, 1_000_000),
+            (100_000, 10_000_000, 5_000_000),
+            (LMSR_B_MAX, 100_000, 50_000),
+        ];
+
+        for (b, q0, q1) in test_cases {
+            let p0 = lmsr_marginal_price(b, q0, q1);
+            let p1 = lmsr_marginal_price(b, q1, q0);
+            let sum = p0 + p1;
+            assert!(
+                sum >= ONE - 1 && sum <= ONE,
+                "Complementarity violated: b={b}, q0={q0}, q1={q1}, p0={p0}, p1={p1}, sum={sum}"
+            );
+            assert!((0..=ONE).contains(&p0));
+            assert!((0..=ONE).contains(&p1));
+        }
+    }
+
+    /// Test LMSR cost_to_buy never exceeds budget
+    #[test]
+    fn lmsr_cost_to_buy_respects_budget() {
+        let b = 5_000;
+        let (q0, q1) = (20_000, 10_000);
+        let budgets = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
+
+        for budget in budgets {
+            let shares = lmsr_shares_affordable(b, q0, q1, budget);
+            let cost = lmsr_cost_to_buy(b, q0, q1, shares);
+            assert!(
+                cost <= budget,
+                "cost {cost} exceeds budget {budget} for b={b}, q0={q0}, q1={q1}"
+            );
+            // Next share should exceed budget (unless we hit the budget limit)
+            if shares < budget {
+                let next_cost = lmsr_cost_to_buy(b, q0, q1, shares + 1);
+                assert!(next_cost > budget, "next share should exceed budget");
+            }
+        }
+    }
+
+    /// Test LMSR with very large share counts (stress test)
+    #[test]
+    fn lmsr_large_share_counts() {
+        let b = 1_000_000;
+        let (q0, q1) = (50_000_000, 30_000_000);
+        let cost = lmsr_cost(b, q0, q1);
+        assert!(cost >= q0);
+        assert!(cost <= q0 + b * 2); // surplus should be bounded
+
+        let p0 = lmsr_marginal_price(b, q0, q1);
+        let p1 = lmsr_marginal_price(b, q1, q0);
+        assert!(p0 + p1 >= ONE - 1 && p0 + p1 <= ONE);
+
+        // Buying more should work
+        let buy_shares = 1_000_000;
+        let buy_cost = lmsr_cost_to_buy(b, q0, q1, buy_shares);
+        assert!(buy_cost > 0);
+        assert!(buy_cost <= buy_shares); // marginal price <= 1.0
+
+        // Selling should work
+        let sell_proceeds = lmsr_cost_to_sell(b, q0, q1, 1_000_000);
+        assert!(sell_proceeds >= 0);
+        assert!(sell_proceeds <= 1_000_000);
+    }
+
+    /// Test pari-mutuel payout edge cases
+    #[test]
+    fn pari_mutuel_payout_edge_cases() {
+        // Zero total pool
+        assert_eq!(pari_mutuel_payout(100, 0, 0), 100);
+        // Zero winning shares (refund principal)
+        assert_eq!(pari_mutuel_payout(100, 500, 0), 100);
+        // Holder has zero shares
+        assert_eq!(pari_mutuel_payout(0, 1_000, 500), 0);
+        // Holder has all winning shares
+        assert_eq!(pari_mutuel_payout(500, 1_000, 500), 1_000);
+        // Proportional split
+        assert_eq!(pari_mutuel_payout(250, 1_000, 500), 500);
+    }
 }
